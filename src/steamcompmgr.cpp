@@ -3967,6 +3967,38 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		if ( drm_set_color_gain_blend( &g_DRM, flBlend ) )
 			hasRepaint = true;
 	}
+	if ( ev->atom == ctx->atoms.gamescopeColorGammaExponent )
+	{
+		std::vector< uint32_t > user_vec;
+		bool bHasVec = get_prop( ctx, ctx->root, ctx->atoms.gamescopeColorGammaExponent, user_vec );
+		
+		// identity
+		float vec[3] = { 1.0f, 1.0f, 1.0f, };
+		if ( bHasVec && user_vec.size() == 3 )
+		{
+			for (int i = 0; i < 3; i++)
+				vec[i] = bit_cast<float>( user_vec[i] );
+		}
+
+		if ( drm_set_gamma_exponent( &g_DRM, vec ) )
+			hasRepaint = true;
+	}
+	if ( ev->atom == ctx->atoms.gamescopeColorDegammaExponent )
+	{
+		std::vector< uint32_t > user_vec;
+		bool bHasVec = get_prop( ctx, ctx->root, ctx->atoms.gamescopeColorDegammaExponent, user_vec );
+		
+		// identity
+		float vec[3] = { 1.0f, 1.0f, 1.0f, };
+		if ( bHasVec && user_vec.size() == 3 )
+		{
+			for (int i = 0; i < 3; i++)
+				vec[i] = bit_cast<float>( user_vec[i] );
+		}
+
+		if ( drm_set_degamma_exponent( &g_DRM, vec ) )
+			hasRepaint = true;
+	}
 	if ( ev->atom == ctx->atoms.gamescopeXWaylandModeControl )
 	{
 		std::vector< uint32_t > xwayland_mode_ctl;
@@ -4913,6 +4945,10 @@ void init_xwayland_ctx(gamescope_xwayland_server_t *xwayland_server)
 	ctx->atoms.gamescopeColorGain = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_GAIN", false );
 	ctx->atoms.gamescopeColorMatrix = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_MATRIX", false );
 	ctx->atoms.gamescopeColorLinearGainBlend = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_LINEARGAIN_BLEND", false );
+
+	ctx->atoms.gamescopeColorGammaExponent = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_GAMMA_EXPONENT", false );
+	ctx->atoms.gamescopeColorDegammaExponent = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_DEGAMMA_EXPONENT", false );
+
 	ctx->atoms.gamescopeXWaylandModeControl = XInternAtom( ctx->dpy, "GAMESCOPE_XWAYLAND_MODE_CONTROL", false );
 	ctx->atoms.gamescopeFPSLimit = XInternAtom( ctx->dpy, "GAMESCOPE_FPS_LIMIT", false );
 	ctx->atoms.gamescopeDynamicRefresh = XInternAtom( ctx->dpy, "GAMESCOPE_DYNAMIC_REFRESH", false );
