@@ -26,14 +26,12 @@ jobs:
           export CC=gcc CXX=g++
           meson build-gcc/ --werror --auto-features=enabled
           ninja -C build-gcc/
-      - name: Build with clang
+      - name: Prepare Release Packs
         run: |
-          export CC=clang CXX=clang++
-          meson build-clang/ --werror --auto-features=enabled
-          ninja -C build-clang/
+          cp -Rf build-gcc/ ./
       - name: Upload to Artifacts
         uses: actions/upload-artifact@v2
         with:
           name: gamescope-${{ env.GIT_SHA }}
           path: |
-            *gamescope
+            gamescope
