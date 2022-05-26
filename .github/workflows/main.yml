@@ -28,7 +28,7 @@ jobs:
           ninja -C build-gcc/
       - name: Prepare Release Packs
         run: |
-          ls -alh ./
+          ls -alh ./build-gcc/
       - name: Upload to Artifacts
         uses: actions/upload-artifact@v2
         with:
