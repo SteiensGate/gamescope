@@ -4,63 +4,9 @@
 
 #include <wayland-server-core.h>
 #include <atomic>
-#include <vector>
-#include <memory>
-#include <mutex>
-#include <map>
 
 #define WLSERVER_BUTTON_COUNT 4
 #define WLSERVER_TOUCH_COUNT 11 // Ten fingers + nose ought to be enough for anyone
-
-struct _XDisplay;
-struct xwayland_ctx_t;
-
-struct ResListEntry_t {
-	struct wlr_surface *surf;
-	struct wlr_buffer *buf;
-};
-
-struct wlserver_content_override;
-
-class gamescope_xwayland_server_t
-{
-public:
-	gamescope_xwayland_server_t(wl_display *display);
-	~gamescope_xwayland_server_t();
-
-	void on_xwayland_ready(void *data);
-	static void xwayland_ready_callback(struct wl_listener *listener, void *data);
-
-	bool is_xwayland_ready() const;
-	const char *get_nested_display_name() const;
-
-	void set_wl_id( struct wlserver_surface *surf, long id );
-
-	_XDisplay *get_xdisplay();
-
-	std::unique_ptr<xwayland_ctx_t> ctx;
-
-	void wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf);
-
-	std::vector<ResListEntry_t> retrieve_commits();
-
-	void handle_override_window_content( struct wl_client *client, struct wl_resource *resource, struct wl_resource *surface_resource, uint32_t x11_window );
-	void destroy_content_override(struct wlserver_content_override *co);
-
-	struct wl_client *get_client();
-
-private:
-	struct wlr_xwayland_server *xwayland_server = NULL;
-	struct wl_listener xwayland_ready_listener = { .notify = xwayland_ready_callback };
-
-	std::map<uint32_t, wlserver_content_override *> content_overrides;
-
-	bool xwayland_ready = false;
-	_XDisplay *dpy = NULL;
-
-	std::mutex wayland_commit_lock;
-	std::vector<ResListEntry_t> wayland_commit_queue;
-};
 
 struct wlserver_t {
 	struct wl_display *display;
@@ -69,23 +15,21 @@ struct wlserver_t {
 
 	struct {
 		struct wlr_backend *multi_backend;
-		struct wlr_backend *headless_backend;
+		struct wlr_backend *noop_backend;
 		struct wlr_backend *libinput_backend;
 
 		struct wlr_renderer *renderer;
 		struct wlr_compositor *compositor;
+		struct wlr_xwayland_server *xwayland_server;
 		struct wlr_session *session;	
 		struct wlr_seat *seat;
 		struct wlr_output *output;
 
 		// Used to simulate key events and set the keymap
 		struct wlr_input_device *virtual_keyboard_device;
-
-		std::vector<std::unique_ptr<gamescope_xwayland_server_t>> xwayland_servers;
 	} wlr;
 	
 	struct wlr_surface *mouse_focus_surface;
-	struct wlr_surface *kb_focus_surface;
 	double mouse_surface_cursorx;
 	double mouse_surface_cursory;
 	
@@ -126,7 +70,6 @@ enum wlserver_touch_click_mode {
 	WLSERVER_TOUCH_CLICK_RIGHT = 2,
 	WLSERVER_TOUCH_CLICK_MIDDLE = 3,
 	WLSERVER_TOUCH_CLICK_PASSTHROUGH = 4,
-	WLSERVER_TOUCH_CLICK_DISABLED = 5,
 };
 
 extern enum wlserver_touch_click_mode g_nDefaultTouchClickMode;
@@ -154,7 +97,7 @@ void wlserver_mousewheel( int x, int y, uint32_t time );
 
 void wlserver_send_frame_done( struct wlr_surface *surf, const struct timespec *when );
 
-gamescope_xwayland_server_t *wlserver_get_xwayland_server( size_t index );
+const char *wlserver_get_nested_display_name( void );
 const char *wlserver_get_wl_display_name( void );
 
 struct wlserver_surface
@@ -169,8 +112,5 @@ struct wlserver_surface
 };
 
 void wlserver_surface_init( struct wlserver_surface *surf, long x11_id );
+void wlserver_surface_set_wl_id( struct wlserver_surface *surf, long id );
 void wlserver_surface_finish( struct wlserver_surface *surf );
-
-void wlserver_set_xwayland_server_mode( size_t idx, int w, int h, int refresh );
-
-extern std::atomic<bool> g_bPendingTouchMovement;

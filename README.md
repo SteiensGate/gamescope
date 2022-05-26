@@ -11,7 +11,7 @@ It also runs on top of a regular desktop, the 'nested' usecase steamcompmgr didn
  - Because the game is running in its own personal Xwayland sandbox desktop, it can't interfere with your desktop and your desktop can't interfere with it.
  - You can spoof a virtual screen with a desired resolution and refresh rate as the only thing the game sees, and control/resize the output as needed. This can be useful in exotic display configurations like ultrawide or multi-monitor setups that involve rotation.
 
-It runs on Mesa + AMD or Intel, and could be made to run on other Mesa/DRM drivers with minimal work. AMD requires Mesa 20.3+, Intel requires Mesa 21.2+. For NVIDIA's proprietary driver, version 515.43.04+ is required (make sure the `nvidia-drm.modeset=1` kernel parameter is set).
+It runs on Mesa + AMD or Intel, and could be made to run on other Mesa/DRM drivers with minimal work. AMD requires Mesa 20.3+, Intel requires Mesa 21.2+. Can support NVIDIA if/when they support atomic KMS + accelerated Xwayland + Vulkan DMA-BUF extensions.
 
 If running RadeonSI clients with older cards (GFX8 and below), currently have to set `R600_DEBUG=nodcc`, or corruption will be observed until the stack picks up DRM modifiers support.
 
@@ -34,11 +34,7 @@ meson install -C build/ --skip-subprojects
 
 * **Super + F** : Toggle fullscreen
 * **Super + N** : Toggle integer scaling
-* **Super + U** : Toggle FSR upscaling
-* **Super + Y** : Toggle NIS upscaling
-* **Super + I** : Increase FSR sharpness by 1
-* **Super + O** : Decrease FSR sharpness by 1
-* **Super + S** : Take screenshot (currently goes to `/tmp/gamescope_$DATE.png`)
+* **Super + S** : Take screenshot (currently goes to `/tmp/gamescope_$DATE.bmp`)
 
 ## Examples
 
@@ -63,8 +59,6 @@ See `gamescope --help` for a full list of options.
 * `-w`, `-h`: set the resolution used by the game. If `-h` is specified but `-w` isn't, a 16:9 aspect ratio is assumed. Defaults to the values specified in `-W` and `-H`.
 * `-r`: set a frame-rate limit for the game. Specified in frames per second. Defaults to unlimited.
 * `-o`: set a frame-rate limit for the game when unfocused. Specified in frames per second. Defaults to unlimited.
-* `-U`: use AMD FidelityFX™ Super Resolution 1.0 for upscaling
-* `-Y`: use NVIDIA Image Scaling v1.0.2 for upscaling
 * `-n`: use integer scaling.
 * `-b`: create a border-less window.
 * `-f`: create a full-screen window.

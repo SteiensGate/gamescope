@@ -4,7 +4,6 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#include <inttypes.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -18,15 +17,14 @@ extern "C" {
 #include <wlr/types/wlr_buffer.h>
 }
 
+#include "cvt.hpp"
 #include "drm.hpp"
 #include "main.hpp"
-#include "modegen.hpp"
 #include "vblankmanager.hpp"
 #include "wlserver.hpp"
 #include "log.hpp"
 
 #include "gpuvis_trace_utils.h"
-#include "steamcompmgr.hpp"
 
 #include <algorithm>
 #include <thread>
@@ -39,8 +37,6 @@ bool g_bRotated = false;
 bool g_bUseLayers = true;
 bool g_bDebugLayers = false;
 const char *g_sOutputName = nullptr;
-
-enum drm_mode_generation g_drmModeGeneration = DRM_MODE_GENERATE_CVT;
 
 static LogScope drm_log("drm");
 static LogScope drm_verbose_log("drm", LOG_SILENT);
@@ -70,12 +66,6 @@ static std::map< uint32_t, const char * > connector_types = {
 	{ DRM_MODE_CONNECTOR_USB, "USB" },
 #endif
 };
-
-static struct fb& get_fb( struct drm_t& drm, uint32_t id )
-{
-	std::lock_guard<std::mutex> m( drm.fb_map_mutex );
-	return drm.fb_map[ id ];
-}
 
 static uint32_t get_connector_possible_crtcs(struct drm_t *drm, const drmModeConnector *connector) {
 	uint32_t possible_crtcs = 0;
@@ -181,7 +171,7 @@ static struct plane *find_primary_plane(struct drm_t *drm)
 	return primary;
 }
 
-static void drm_unlock_fb_internal( struct drm_t *drm, struct fb *fb );
+static void drm_free_fb( struct drm_t *drm, struct fb *fb );
 
 static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, unsigned int crtc_id, void *data)
 {
@@ -190,9 +180,7 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 	if ( g_DRM.crtc->id != crtc_id )
 		return;
 
-	// This is the last vblank time
-	uint64_t vblanktime = sec * 1'000'000'000lu + usec * 1'000lu;
-	vblank_mark_possible_vblank(vblanktime);
+	vblank_mark_possible_vblank();
 
 	// TODO: get the fbids_queued instance from data if we ever have more than one in flight
 
@@ -203,34 +191,22 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 	{
 		uint32_t previous_fbid = g_DRM.fbids_on_screen[ i ];
 		assert( previous_fbid != 0 );
+		assert( g_DRM.map_fbid_inflightflips[ previous_fbid ].n_refs > 0 );
 
-		struct fb &previous_fb = get_fb( g_DRM, previous_fbid );
+		g_DRM.map_fbid_inflightflips[ previous_fbid ].n_refs--;
 
-		if ( --previous_fb.n_refs == 0 )
+		if ( g_DRM.map_fbid_inflightflips[ previous_fbid ].n_refs == 0 )
 		{
 			// we flipped away from this previous fbid, now safe to delete
 			std::lock_guard<std::mutex> lock( g_DRM.free_queue_lock );
-
-			for ( uint32_t i = 0; i < g_DRM.fbid_unlock_queue.size(); i++ )
-			{
-				if ( g_DRM.fbid_unlock_queue[ i ] == previous_fbid )
-				{
-					drm_verbose_log.debugf("deferred unlock %u", previous_fbid);
-
-					drm_unlock_fb_internal( &g_DRM, &get_fb( g_DRM, previous_fbid ) );
-
-					g_DRM.fbid_unlock_queue.erase( g_DRM.fbid_unlock_queue.begin() + i );
-					break;
-				}
-			}
 
 			for ( uint32_t i = 0; i < g_DRM.fbid_free_queue.size(); i++ )
 			{
 				if ( g_DRM.fbid_free_queue[ i ] == previous_fbid )
 				{
-					drm_verbose_log.debugf( "deferred free %u", previous_fbid );
+					drm_verbose_log.debugf("deferred free %u", previous_fbid);
 
-					drm_drop_fbid( &g_DRM, previous_fbid );
+					drm_free_fb( &g_DRM, &g_DRM.map_fbid_inflightflips[ previous_fbid ] );
 
 					g_DRM.fbid_free_queue.erase( g_DRM.fbid_free_queue.begin() + i );
 					break;
@@ -247,8 +223,6 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 
 void flip_handler_thread_run(void)
 {
-	pthread_setname_np( pthread_self(), "gamescope-kms" );
-
 	struct pollfd pollfd = {
 		.fd = g_DRM.fd,
 		.events = POLLIN,
@@ -327,54 +301,10 @@ static bool compare_modes( drmModeModeInfo mode1, drmModeModeInfo mode2 )
 
 static bool refresh_state( drm_t *drm )
 {
-	drmModeRes *resources = drmModeGetResources(drm->fd);
-	if (resources == nullptr) {
-		drm_log.errorf_errno("drmModeGetResources failed");
-		return false;
-	}
+	// TODO: refresh list of connectors for DP-MST
 
-	// Add connectors which appeared
-	for (int i = 0; i < resources->count_connectors; i++) {
-		uint32_t conn_id = resources->connectors[i];
-
-		if (drm->connectors.count(conn_id) == 0) {
-			struct connector conn = { .id = conn_id };
-			drm->connectors[conn_id] = conn;
-		}
-	}
-
-	// Remove connectors which disappeared
-	auto it = drm->connectors.begin();
-	while (it != drm->connectors.end()) {
-		struct connector *conn = &it->second;
-
-		bool found = false;
-		for (int j = 0; j < resources->count_connectors; j++) {
-			if (resources->connectors[j] == conn->id) {
-				found = true;
-				break;
-			}
-		}
-
-		if (!found) {
-			if (drm->connector == conn) {
-				drm_log.infof("current connector '%s' disconnected", conn->name);
-				drm->connector = nullptr;
-			}
-
-			free(conn->name);
-			drmModeFreeConnector(conn->connector);
-			it = drm->connectors.erase(it);
-		} else {
-			it++;
-		}
-	}
-
-	drmModeFreeResources(resources);
-
-	// Re-probe connectors props and status
-	for (auto &kv : drm->connectors) {
-		struct connector *conn = &kv.second;
+	for (size_t i = 0; i < drm->connectors.size(); i++) {
+		struct connector *conn = &drm->connectors[i];
 		if (!get_object_properties(drm, conn->id, DRM_MODE_OBJECT_CONNECTOR, conn->props, conn->initial_prop_values)) {
 			return false;
 		}
@@ -391,20 +321,6 @@ static bool refresh_state( drm_t *drm )
 		/* sort modes by preference: preferred flag, then highest area, then
 		 * highest refresh rate */
 		std::stable_sort(conn->connector->modes, conn->connector->modes + conn->connector->count_modes, compare_modes);
-
-		if ( conn->name != nullptr )
-			continue;
-
-		const char *type_str = "Unknown";
-		if ( connector_types.count( conn->connector->connector_type ) > 0 )
-			type_str = connector_types[ conn->connector->connector_type ];
-
-		char name[128] = {};
-		snprintf(name, sizeof(name), "%s-%d", type_str, conn->connector->connector_type_id);
-
-		conn->name = strdup(name);
-
-		conn->possible_crtcs = get_connector_possible_crtcs(drm, conn->connector);
 	}
 
 	for (size_t i = 0; i < drm->crtcs.size(); i++) {
@@ -412,13 +328,6 @@ static bool refresh_state( drm_t *drm )
 		if (!get_object_properties(drm, crtc->id, DRM_MODE_OBJECT_CRTC, crtc->props, crtc->initial_prop_values)) {
 			return false;
 		}
-
-		crtc->has_gamma_lut = (crtc->props.find( "GAMMA_LUT" ) != crtc->props.end());
-		if (!crtc->has_gamma_lut)
-			drm_log.infof("CRTC %" PRIu32 " has no gamma LUT support", crtc->id);
-		crtc->has_ctm = (crtc->props.find( "CTM" ) != crtc->props.end());
-		if (!crtc->has_ctm)
-			drm_log.infof("CRTC %" PRIu32 " has no CTM support", crtc->id);
 
 		crtc->current.active = crtc->initial_prop_values["ACTIVE"];
 	}
@@ -439,6 +348,11 @@ static bool get_resources(struct drm_t *drm)
 	if (resources == nullptr) {
 		drm_log.errorf_errno("drmModeGetResources failed");
 		return false;
+	}
+
+	for (int i = 0; i < resources->count_connectors; i++) {
+		struct connector conn = { .id = resources->connectors[i] };
+		drm->connectors.push_back(conn);
 	}
 
 	for (int i = 0; i < resources->count_crtcs; i++) {
@@ -477,6 +391,21 @@ static bool get_resources(struct drm_t *drm)
 
 	if (!refresh_state(drm))
 		return false;
+
+	for (size_t i = 0; i < drm->connectors.size(); i++) {
+		struct connector *conn = &drm->connectors[i];
+
+		const char *type_str = "Unknown";
+		if ( connector_types.count( conn->connector->connector_type ) > 0 )
+			type_str = connector_types[ conn->connector->connector_type ];
+
+		char name[128] = {};
+		snprintf(name, sizeof(name), "%s-%d", type_str, conn->connector->connector_type_id);
+
+		conn->name = strdup(name);
+
+		conn->possible_crtcs = get_connector_possible_crtcs(drm, conn->connector);
+	}
 
 	for (size_t i = 0; i < drm->crtcs.size(); i++) {
 		struct crtc *crtc = &drm->crtcs[i];
@@ -542,8 +471,8 @@ static bool setup_best_connector(struct drm_t *drm)
 
 	struct connector *best = nullptr;
 	int best_priority = INT_MAX;
-	for (auto &kv : drm->connectors) {
-		struct connector *conn = &kv.second;
+	for (size_t i = 0; i < drm->connectors.size(); i++) {
+		struct connector *conn = &drm->connectors[i];
 
 		if (conn->connector->connection != DRM_MODE_CONNECTED)
 			continue;
@@ -691,8 +620,8 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 		return false;
 
 	drm_log.infof("Connectors:");
-	for (const auto &kv : drm->connectors) {
-		const struct connector *conn = &kv.second;
+	for (size_t i = 0; i < drm->connectors.size(); i++) {
+		struct connector *conn = &drm->connectors[i];
 
 		const char *status_str = "disconnected";
 		if ( conn->connector->connection == DRM_MODE_CONNECTED )
@@ -780,16 +709,11 @@ void finish_drm(struct drm_t *drm)
 	// together.
 
 	drmModeAtomicReq *req = drmModeAtomicAlloc();
-	for ( auto &kv : drm->connectors ) {
-		struct connector *conn = &kv.second;
-		add_connector_property(req, conn, "CRTC_ID", 0);
+	for ( size_t i = 0; i < drm->connectors.size(); i++ ) {
+		add_connector_property(req, &drm->connectors[i], "CRTC_ID", 0);
 	}
 	for ( size_t i = 0; i < drm->crtcs.size(); i++ ) {
 		add_crtc_property(req, &drm->crtcs[i], "MODE_ID", 0);
-		if ( drm->crtcs[i].has_gamma_lut )
-			add_crtc_property(req, &drm->crtcs[i], "GAMMA_LUT", 0);
-		if ( drm->crtcs[i].has_ctm )
-			add_crtc_property(req, &drm->crtcs[i], "CTM", 0);
 		add_crtc_property(req, &drm->crtcs[i], "ACTIVE", 0);
 	}
 	for ( size_t i = 0; i < drm->planes.size(); i++ ) {
@@ -822,7 +746,7 @@ void finish_drm(struct drm_t *drm)
 	// page-flip handler thread.
 }
 
-int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
+int drm_commit(struct drm_t *drm, struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline )
 {
 	int ret;
 
@@ -843,9 +767,8 @@ int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 	// potentially beat us to the refcount checks.
 	for ( uint32_t i = 0; i < drm->fbids_in_req.size(); i++ )
 	{
-		struct fb &fb = get_fb( g_DRM, drm->fbids_in_req[ i ] );
-		assert( fb.held_refs );
-		fb.n_refs++;
+		assert( g_DRM.map_fbid_inflightflips[ drm->fbids_in_req[ i ] ].held == true );
+		g_DRM.map_fbid_inflightflips[ drm->fbids_in_req[ i ] ].n_refs++;
 	}
 
 	assert( drm->fbids_queued.size() == 0 );
@@ -863,9 +786,7 @@ int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 
 		if ( ret != -EBUSY && ret != -EACCES )
 		{
-			drm_log.errorf( "fatal flip error, aborting" );
-			drm->flip_lock.unlock();
-			abort();
+			exit( 1 );
 		}
 
 		drm->pending = drm->current;
@@ -878,7 +799,7 @@ int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 		// Undo refcount if the commit didn't actually work
 		for ( uint32_t i = 0; i < drm->fbids_in_req.size(); i++ )
 		{
-			get_fb( g_DRM, drm->fbids_in_req[ i ] ).n_refs--;
+			g_DRM.map_fbid_inflightflips[ drm->fbids_in_req[ i ] ].n_refs--;
 		}
 
 		drm->fbids_queued.clear();
@@ -895,20 +816,9 @@ int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 
 		for ( size_t i = 0; i < drm->crtcs.size(); i++ )
 		{
-			if ( drm->pending.mode_id != drm->current.mode_id )
-				drmModeDestroyPropertyBlob(drm->fd, drm->current.mode_id);
-			if ( drm->pending.gamma_lut_id != drm->current.gamma_lut_id )
-				drmModeDestroyPropertyBlob(drm->fd, drm->current.gamma_lut_id);
 			drm->crtcs[i].current = drm->crtcs[i].pending;
 		}
 	}
-
-	// Update the draw time
-	// Ideally this would be updated by something right before the page flip
-	// is queued and would end up being the new page flip, rather than here.
-	// However, the page flip handler is called when the page flip occurs,
-	// not when it is successfully queued.
-	g_uVblankDrawTimeNS = get_time_in_nanos() - g_SteamCompMgrVBlankTime;
 
 	// Wait for flip handler to unlock
 	drm->flip_lock.lock();
@@ -975,17 +885,19 @@ uint32_t drm_fbid_from_dmabuf( struct drm_t *drm, struct wlr_buffer *buf, struct
 	}
 
 	drm_verbose_log.debugf("make fbid %u", fb_id);
+	assert( drm->map_fbid_inflightflips[ fb_id ].held == false );
 
-	/* Nested scope so fb doesn't end up in the out: label */
+	if ( buf != nullptr )
 	{
-		struct fb &fb = get_fb( *drm, fb_id );
-		assert( fb.held_refs == 0 );
-		fb.id = fb_id;
-		fb.buf = buf;
-		if (!buf)
-			fb.held_refs++;
-		fb.n_refs = 0;
+		wlserver_lock();
+		buf = wlr_buffer_lock( buf );
+		wlserver_unlock();
 	}
+
+	drm->map_fbid_inflightflips[ fb_id ].id = fb_id;
+	drm->map_fbid_inflightflips[ fb_id ].buf = buf;
+	drm->map_fbid_inflightflips[ fb_id ].held = true;
+	drm->map_fbid_inflightflips[ fb_id ].n_refs = 0;
 
 out:
 	for ( int i = 0; i < dma_buf->n_planes; i++ ) {
@@ -1012,31 +924,15 @@ out:
 	return fb_id;
 }
 
-void drm_drop_fbid( struct drm_t *drm, uint32_t fbid )
+static void drm_free_fb( struct drm_t *drm, struct fb *fb )
 {
-	struct fb &fb = get_fb( *drm, fbid );
-	assert( fb.held_refs == 0 ||
-	        fb.buf == nullptr );
+	assert( !fb->held );
+	assert( fb->n_refs == 0 );
 
-	fb.held_refs = 0;
-
-	if ( fb.n_refs != 0 )
-	{
-		std::lock_guard<std::mutex> lock( drm->free_queue_lock );
-		drm->fbid_free_queue.push_back( fbid );
-		return;
-	}
-
-	if (drmModeRmFB( drm->fd, fbid ) != 0 )
+	if ( drmModeRmFB( drm->fd, fb->id ) != 0 )
 	{
 		drm_log.errorf_errno( "drmModeRmFB failed" );
 	}
-}
-
-static void drm_unlock_fb_internal( struct drm_t *drm, struct fb *fb )
-{
-	assert( fb->held_refs == 0 );
-	assert( fb->n_refs == 0 );
 
 	if ( fb->buf != nullptr )
 	{
@@ -1044,65 +940,50 @@ static void drm_unlock_fb_internal( struct drm_t *drm, struct fb *fb )
 		wlr_buffer_unlock( fb->buf );
 		wlserver_unlock();
 	}
+
+	fb = {};
 }
 
-void drm_lock_fbid( struct drm_t *drm, uint32_t fbid )
+void drm_drop_fbid( struct drm_t *drm, uint32_t fbid )
 {
-	struct fb &fb = get_fb( *drm, fbid );
-	assert( fb.n_refs == 0 );
+	assert( drm->map_fbid_inflightflips[ fbid ].held == true );
+	drm->map_fbid_inflightflips[ fbid ].held = false;
 
-	if ( fb.held_refs++ == 0 )
+	if ( drm->map_fbid_inflightflips[ fbid ].n_refs == 0 )
 	{
-		if ( fb.buf != nullptr )
-		{
-			wlserver_lock();
-			wlr_buffer_lock( fb.buf );
-			wlserver_unlock();
-		}
+		/* FB isn't being used in any page-flip, free it immediately */
+		drm_verbose_log.debugf("free fbid %u", fbid);
+		drm_free_fb( drm, &drm->map_fbid_inflightflips[ fbid ] );
 	}
-}
-
-void drm_unlock_fbid( struct drm_t *drm, uint32_t fbid )
-{
-	struct fb &fb = get_fb( *drm, fbid );
-	
-	assert( fb.held_refs > 0 );
-	if ( --fb.held_refs != 0 )
-		return;
-
-	if ( fb.n_refs != 0 )
+	else
 	{
 		std::lock_guard<std::mutex> lock( drm->free_queue_lock );
-		drm->fbid_unlock_queue.push_back( fbid );
-		return;
-	}
 
-	/* FB isn't being used in any page-flip, free it immediately */
-	drm_verbose_log.debugf("free fbid %u", fbid);
-	drm_unlock_fb_internal( drm, &fb );
+		drm->fbid_free_queue.push_back( fbid );
+	}
 }
 
 /* Prepares an atomic commit without using libliftoff */
 static int
-drm_prepare_basic( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
+drm_prepare_basic( struct drm_t *drm, const struct Composite_t *pComposite, const struct VulkanPipeline_t *pPipeline )
 {
 	// Discard cases where our non-liftoff path is known to fail
 
 	// It only supports one layer
-	if ( frameInfo->layerCount > 1 )
+	if ( pComposite->nLayerCount > 1 )
 	{
-		drm_verbose_log.errorf("drm_prepare_basic: cannot handle %d layers", frameInfo->layerCount);
+		drm_verbose_log.errorf("drm_prepare_basic: cannot handle %d layers", pComposite->nLayerCount);
 		return -EINVAL;
 	}
 
-	if ( frameInfo->layers[ 0 ].fbid == 0 )
+	if ( pPipeline->layerBindings[ 0 ].fbid == 0 )
 	{
 		drm_verbose_log.errorf("drm_prepare_basic: layer has no FB");
 		return -EINVAL;
 	}
 
 	drmModeAtomicReq *req = drm->req;
-	uint32_t fb_id = frameInfo->layers[ 0 ].fbid;
+	uint32_t fb_id = pPipeline->layerBindings[ 0 ].fbid;
 
 	drm->fbids_in_req.push_back( fb_id );
 
@@ -1112,27 +993,22 @@ drm_prepare_basic( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 	add_plane_property(req, drm->primary, "CRTC_ID", drm->crtc->id);
 	add_plane_property(req, drm->primary, "SRC_X", 0);
 	add_plane_property(req, drm->primary, "SRC_Y", 0);
-
-	const uint16_t srcWidth = frameInfo->layers[ 0 ].tex->width();
-	const uint16_t srcHeight = frameInfo->layers[ 0 ].tex->height();
-
-	add_plane_property(req, drm->primary, "SRC_W", srcWidth << 16);
-	add_plane_property(req, drm->primary, "SRC_H", srcHeight << 16);
+	add_plane_property(req, drm->primary, "SRC_W", pPipeline->layerBindings[ 0 ].surfaceWidth << 16);
+	add_plane_property(req, drm->primary, "SRC_H", pPipeline->layerBindings[ 0 ].surfaceHeight << 16);
 
 	gpuvis_trace_printf ( "legacy flip fb_id %u src %ix%i", fb_id,
-						 srcWidth, srcHeight );
+						 pPipeline->layerBindings[ 0 ].surfaceWidth,
+						 pPipeline->layerBindings[ 0 ].surfaceHeight );
 
-	int64_t crtcX = frameInfo->layers[ 0 ].offset.x * -1;
-	int64_t crtcY = frameInfo->layers[ 0 ].offset.y * -1;
-	int64_t crtcW = srcWidth / frameInfo->layers[ 0 ].scale.x;
-	int64_t crtcH = srcHeight / frameInfo->layers[ 0 ].scale.y;
+	int64_t crtcX = pComposite->data.vOffset[ 0 ].x * -1;
+	int64_t crtcY = pComposite->data.vOffset[ 0 ].y * -1;
+	int64_t crtcW = pPipeline->layerBindings[ 0 ].surfaceWidth / pComposite->data.vScale[ 0 ].x;
+	int64_t crtcH = pPipeline->layerBindings[ 0 ].surfaceHeight / pComposite->data.vScale[ 0 ].y;
 
 	if ( g_bRotated )
 	{
-		int64_t imageH = frameInfo->layers[ 0 ].tex->contentHeight() / frameInfo->layers[ 0 ].scale.y;
-
 		int64_t tmp = crtcX;
-		crtcX = g_nOutputHeight - imageH - crtcY;
+		crtcX = crtcY;
 		crtcY = tmp;
 
 		tmp = crtcW;
@@ -1160,43 +1036,46 @@ drm_prepare_basic( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 }
 
 static int
-drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
+drm_prepare_liftoff( struct drm_t *drm, const struct Composite_t *pComposite, const struct VulkanPipeline_t *pPipeline )
 {
 	for ( int i = 0; i < k_nMaxLayers; i++ )
 	{
-		if ( i < frameInfo->layerCount )
+		if ( i < pComposite->nLayerCount )
 		{
-			if ( frameInfo->layers[ i ].fbid == 0 )
+			if ( pPipeline->layerBindings[ i ].fbid == 0 )
 			{
 				drm_verbose_log.errorf("drm_prepare_liftoff: layer %d has no FB", i );
 				return -EINVAL;
 			}
 
-			liftoff_layer_set_property( drm->lo_layers[ i ], "FB_ID", frameInfo->layers[ i ].fbid);
-			drm->fbids_in_req.push_back( frameInfo->layers[ i ].fbid );
+			liftoff_layer_set_property( drm->lo_layers[ i ], "FB_ID", pPipeline->layerBindings[ i ].fbid);
+			drm->fbids_in_req.push_back( pPipeline->layerBindings[ i ].fbid );
 
-			liftoff_layer_set_property( drm->lo_layers[ i ], "zpos", frameInfo->layers[ i ].zpos );
-			liftoff_layer_set_property( drm->lo_layers[ i ], "alpha", frameInfo->layers[ i ].opacity * 0xffff);
+			liftoff_layer_set_property( drm->lo_layers[ i ], "zpos", pPipeline->layerBindings[ i ].zpos );
+			liftoff_layer_set_property( drm->lo_layers[ i ], "alpha", pComposite->data.flOpacity[ i ] * 0xffff);
 
-			const uint16_t srcWidth = frameInfo->layers[ i ].tex->width();
-			const uint16_t srcHeight = frameInfo->layers[ i ].tex->height();
+			if ( pPipeline->layerBindings[ i ].zpos == 0 )
+			{
+				assert( ( pComposite->data.flOpacity[ i ] * 0xffff ) == 0xffff );
+			}
+
+			const uint16_t srcWidth = pPipeline->layerBindings[ i ].surfaceWidth;
+			const uint16_t srcHeight = pPipeline->layerBindings[ i ].surfaceHeight;
 
 			liftoff_layer_set_property( drm->lo_layers[ i ], "SRC_X", 0);
 			liftoff_layer_set_property( drm->lo_layers[ i ], "SRC_Y", 0);
 			liftoff_layer_set_property( drm->lo_layers[ i ], "SRC_W", srcWidth << 16);
 			liftoff_layer_set_property( drm->lo_layers[ i ], "SRC_H", srcHeight << 16);
 
-			int32_t crtcX = -frameInfo->layers[ i ].offset.x;
-			int32_t crtcY = -frameInfo->layers[ i ].offset.y;
-			uint64_t crtcW = srcWidth / frameInfo->layers[ i ].scale.x;
-			uint64_t crtcH = srcHeight / frameInfo->layers[ i ].scale.y;
+			int32_t crtcX = -pComposite->data.vOffset[ i ].x;
+			int32_t crtcY = -pComposite->data.vOffset[ i ].y;
+			uint64_t crtcW = srcWidth / pComposite->data.vScale[ i ].x;
+			uint64_t crtcH = srcHeight / pComposite->data.vScale[ i ].y;
 
 			if (g_bRotated) {
-				int64_t imageH = frameInfo->layers[ i ].tex->contentHeight() / frameInfo->layers[ i ].scale.y;
-
 				const int32_t x = crtcX;
 				const uint64_t w = crtcW;
-				crtcX = g_nOutputHeight - imageH - crtcY;
+				crtcX = crtcY;
 				crtcY = x;
 				crtcW = crtcH;
 				crtcH = w;
@@ -1226,20 +1105,17 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 	}
 
 	if ( ret == 0 )
-		drm_verbose_log.debugf( "can drm present %i layers", frameInfo->layerCount );
+		drm_verbose_log.debugf( "can drm present %i layers", pComposite->nLayerCount );
 	else
-		drm_verbose_log.debugf( "can NOT drm present %i layers", frameInfo->layerCount );
+		drm_verbose_log.debugf( "can NOT drm present %i layers", pComposite->nLayerCount );
 
 	return ret;
 }
 
 /* Prepares an atomic commit for the provided scene-graph. Returns false on
  * error or if the scene-graph can't be presented directly. */
-int drm_prepare( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
+int drm_prepare( struct drm_t *drm, const struct Composite_t *pComposite, const struct VulkanPipeline_t *pPipeline )
 {
-	drm_update_gamma_lut(drm);
-	drm_update_color_mtx(drm);
-
 	drm->fbids_in_req.clear();
 
 	bool needs_modeset = drm->needs_modeset.exchange(false);
@@ -1257,9 +1133,8 @@ int drm_prepare( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 
 		// Disable all connectors and CRTCs
 
-		for ( auto &kv : drm->connectors ) {
-			struct connector *conn = &kv.second;
-			if ( add_connector_property( drm->req, conn, "CRTC_ID", 0 ) < 0 )
+		for ( size_t i = 0; i < drm->connectors.size(); i++ ) {
+			if ( add_connector_property( drm->req, &drm->connectors[i], "CRTC_ID", 0 ) < 0 )
 				return false;
 		}
 		for ( size_t i = 0; i < drm->crtcs.size(); i++ ) {
@@ -1270,16 +1145,6 @@ int drm_prepare( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 
 			if (add_crtc_property(drm->req, &drm->crtcs[i], "MODE_ID", 0) < 0)
 				return false;
-			if (drm->crtcs[i].has_gamma_lut)
-			{
-				if (add_crtc_property(drm->req, &drm->crtcs[i], "GAMMA_LUT", 0) < 0)
-					return false;
-			}
-			if (drm->crtcs[i].has_ctm)
-			{
-				if (add_crtc_property(drm->req, &drm->crtcs[i], "CTM", 0) < 0)
-					return false;
-			}
 			if (add_crtc_property(drm->req, &drm->crtcs[i], "ACTIVE", 0) < 0)
 				return false;
 			drm->crtcs[i].pending.active = 0;
@@ -1292,45 +1157,18 @@ int drm_prepare( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 
 		if (add_crtc_property(drm->req, drm->crtc, "MODE_ID", drm->pending.mode_id) < 0)
 			return false;
-
-		if (drm->crtc->has_gamma_lut)
-		{
-			if (add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id) < 0)
-				return false;
-		}
-
-		if (drm->crtc->has_ctm)
-		{
-			if (add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id) < 0)
-				return false;
-		}
-
 		if (add_crtc_property(drm->req, drm->crtc, "ACTIVE", 1) < 0)
 			return false;
 		drm->crtc->pending.active = 1;
-	}
-	else
-	{
-		if ( drm->crtc->has_gamma_lut && drm->pending.gamma_lut_id != drm->current.gamma_lut_id )
-		{
-			if (add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id) < 0)
-				return false;	
-		}
-
-		if ( drm->crtc->has_ctm && drm->pending.ctm_id != drm->current.ctm_id )
-		{
-			if (add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id) < 0)
-				return false;
-		}
 	}
 
 	drm->flags = flags;
 
 	int ret;
 	if ( g_bUseLayers == true ) {
-		ret = drm_prepare_liftoff( drm, frameInfo );
+		ret = drm_prepare_liftoff( drm, pComposite, pPipeline );
 	} else {
-		ret = drm_prepare_basic( drm, frameInfo );
+		ret = drm_prepare_basic( drm, pComposite, pPipeline );
 	}
 
 	if ( ret != 0 ) {
@@ -1339,21 +1177,15 @@ int drm_prepare( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 
 		drm->fbids_in_req.clear();
 
-		if ( needs_modeset )
-			drm->needs_modeset = true;
+		drm->pending = drm->current;
+
+		for ( size_t i = 0; i < drm->crtcs.size(); i++ )
+		{
+			drm->crtcs[i].pending = drm->crtcs[i].current;
+		}
 	}
 
 	return ret;
-}
-
-void drm_rollback( struct drm_t *drm )
-{
-	drm->pending = drm->current;
-
-	for ( size_t i = 0; i < drm->crtcs.size(); i++ )
-	{
-		drm->crtcs[i].pending = drm->crtcs[i].current;
-	}
 }
 
 bool drm_poll_state( struct drm_t *drm )
@@ -1425,209 +1257,6 @@ bool drm_set_connector( struct drm_t *drm, struct connector *conn )
 	return true;
 }
 
-inline float srgb_to_linear( float fVal )
-{
-    return ( fVal < 0.04045f ) ? fVal / 12.92f : std::pow( ( fVal + 0.055f) / 1.055f, 2.4f );
-}
-
-inline float linear_to_srgb( float fVal )
-{
-    return ( fVal < 0.0031308f ) ? fVal * 12.92f : std::pow( fVal, 1.0f / 2.4f ) * 1.055f - 0.055f;
-}
-
-inline int quantize( float fVal, float fMaxVal )
-{
-    return std::max( 0.f, std::min( fMaxVal, roundf( fVal * fMaxVal ) ) );
-}
-
-bool drm_set_color_gains(struct drm_t *drm, float *gains)
-{
-	for (int i = 0; i < 3; i++)
-		drm->pending.color_gain[i] = gains[i];
-
-	for (int i = 0; i < 3; i++)
-	{
-		if ( drm->current.color_gain[i] != drm->pending.color_gain[i] )
-			return true;
-	}
-	return false;
-}
-
-bool drm_set_color_linear_gains(struct drm_t *drm, float *gains)
-{
-	for (int i = 0; i < 3; i++)
-		drm->pending.color_linear_gain[i] = gains[i];
-
-	for (int i = 0; i < 3; i++)
-	{
-		if ( drm->current.color_linear_gain[i] != drm->pending.color_linear_gain[i] )
-			return true;
-	}
-	return false;
-}
-
-bool drm_set_color_mtx(struct drm_t *drm, float *mtx)
-{
-	for (int i = 0; i < 9; i++)
-		drm->pending.color_mtx[i] = mtx[i];
-
-	for (int i = 0; i < 9; i++)
-	{
-		if ( drm->current.color_mtx[i] != drm->pending.color_mtx[i] )
-			return true;
-	}
-	return false;
-}
-
-bool drm_set_color_gain_blend(struct drm_t *drm, float blend)
-{
-	drm->pending.gain_blend = blend;
-	if ( drm->current.gain_blend != drm->pending.gain_blend )
-		return true;
-	return false;
-}
-
-inline float lerp( float a, float b, float t )
-{
-    return a + t * (b - a);
-}
-
-inline uint16_t drm_calc_lut_value( float input, float flLinearGain, float flGain, float flBlend )
-{
-    float flValue = lerp( flGain * input, linear_to_srgb( flLinearGain * srgb_to_linear( input ) ), flBlend );
-	return (uint16_t)quantize( flValue, (float)UINT16_MAX );
-}
-
-bool drm_update_color_mtx(struct drm_t *drm)
-{
-	if ( !drm->crtc->has_ctm )
-		return true;
-
-	static constexpr float g_identity_mtx[9] =
-	{
-		1.0f, 0.0f, 0.0f,
-		0.0f, 1.0f, 0.0f,
-		0.0f, 0.0f, 1.0f,
-	};
-
-	bool dirty = false;
-	for (int i = 0; i < 9; i++)
-	{
-		if (drm->pending.color_mtx[i] != drm->current.color_mtx[i])
-			dirty = true;
-	}
-
-	if (!dirty)
-		return true;
-
-	bool identity = true;
-	for (int i = 0; i < 9; i++)
-	{
-		if (drm->pending.color_mtx[i] != g_identity_mtx[i])
-			identity = false;
-	}
-
-
-	if (identity)
-	{
-		drm->pending.ctm_id = 0;
-		return true;
-	}
-
-	struct drm_color_ctm drm_ctm;
-	for (int i = 0; i < 9; i++)
-	{
-		const float val = drm->pending.color_mtx[i];
-
-		// S31.32 sign-magnitude
-		float integral;
-		float fractional = modf( fabsf( val ), &integral );
-
-		union
-		{
-			struct
-			{
-				uint64_t fractional : 32;
-				uint64_t integral   : 31;
-				uint64_t sign_part  : 1;
-			} s31_32_bits;
-			uint64_t s31_32;
-		} color;
-
-		color.s31_32_bits.sign_part  = val < 0 ? 1 : 0;
-		color.s31_32_bits.integral   = uint64_t( integral );
-		color.s31_32_bits.fractional = uint64_t( fractional * float( 1ull << 32 ) );
-
-		drm_ctm.matrix[i] = color.s31_32;
-	}
-
-	uint32_t blob_id = 0;	
-	if (drmModeCreatePropertyBlob(drm->fd, &drm_ctm,
-			sizeof(struct drm_color_ctm), &blob_id) != 0) {
-		drm_log.errorf_errno("Unable to create CTM property blob");
-		return false;
-	}
-
-	drm->pending.ctm_id = blob_id;
-	return true;
-}
-
-bool drm_update_gamma_lut(struct drm_t *drm)
-{
-	if ( !drm->crtc->has_gamma_lut )
-		return true;
-
-	if (drm->pending.color_gain[0] == drm->current.color_gain[0] &&
-		drm->pending.color_gain[1] == drm->current.color_gain[1] &&
-		drm->pending.color_gain[2] == drm->current.color_gain[2] &&
-		drm->pending.color_linear_gain[0] == drm->current.color_linear_gain[0] &&
-		drm->pending.color_linear_gain[1] == drm->current.color_linear_gain[1] &&
-		drm->pending.color_linear_gain[2] == drm->current.color_linear_gain[2] &&
-		drm->pending.gain_blend == drm->current.gain_blend )
-	{
-		return true;
-	}
-
-	bool color_gain_identity = drm->pending.gain_blend == 1.0f ||
-		( drm->pending.color_gain[0] == 1.0f &&
-		  drm->pending.color_gain[1] == 1.0f &&
-		  drm->pending.color_gain[2] == 1.0f );
-
-	bool linear_gain_identity = drm->pending.gain_blend == 0.0f ||
-		( drm->pending.color_linear_gain[0] == 1.0f &&
-		  drm->pending.color_linear_gain[1] == 1.0f &&
-		  drm->pending.color_linear_gain[2] == 1.0f );
-
-	if ( color_gain_identity && linear_gain_identity )
-	{
-		drm->pending.gamma_lut_id = 0;
-		return true;
-	}
-
-	const int lut_entries = drm->crtc->initial_prop_values["GAMMA_LUT_SIZE"];
-	drm_color_lut *gamma_lut = new drm_color_lut[lut_entries];
-	for ( int i = 0; i < lut_entries; i++ )
-	{
-        float input = float(i) / float(lut_entries - 1);
-		gamma_lut[i].red   = drm_calc_lut_value( input, drm->pending.color_linear_gain[0], drm->pending.color_gain[0], drm->pending.gain_blend );
-		gamma_lut[i].green = drm_calc_lut_value( input, drm->pending.color_linear_gain[1], drm->pending.color_gain[1], drm->pending.gain_blend );
-		gamma_lut[i].blue  = drm_calc_lut_value( input, drm->pending.color_linear_gain[2], drm->pending.color_gain[2], drm->pending.gain_blend );
-	}
-
-	uint32_t blob_id = 0;	
-	if (drmModeCreatePropertyBlob(drm->fd, gamma_lut,
-			lut_entries * sizeof(struct drm_color_lut), &blob_id) != 0) {
-		drm_log.errorf_errno("Unable to create gamma LUT property blob");
-		delete[] gamma_lut;
-		return false;
-	}
-	delete[] gamma_lut;
-
-	drm->pending.gamma_lut_id = blob_id;
-
-	return true;
-}
-
 bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
 {
 	uint32_t mode_id = 0;
@@ -1655,67 +1284,11 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
 	return true;
 }
 
-#define EDID_ID(a, b, c) (((a & 0x1f) << 10) | ((b & 0x1f) << 5) | (c & 0x1f))
-
-struct edid_data_t
-{
-	uint16_t make;
-	char model[16];
-	char serial[16];
-};
-
-// from wlroots... mostly
-void parse_edid(edid_data_t *output, const uint8_t *data, size_t len) {
-	if (!data || len < 128) {
-		output->make = 0;
-		snprintf(output->model, sizeof(output->model), "<Unknown>");
-		return;
-	}
-
-	output->make = (data[8] << 8) | data[9];
-
-	uint16_t model = data[10] | (data[11] << 8);
-	snprintf(output->model, sizeof(output->model), "0x%04X", model);
-
-	uint32_t serial = data[12] | (data[13] << 8) | (data[14] << 8) | (data[15] << 8);
-	snprintf(output->serial, sizeof(output->serial), "0x%08X", serial);
-
-	for (size_t i = 72; i <= 108; i += 18) {
-		uint16_t flag = (data[i] << 8) | data[i + 1];
-		if (flag == 0 && data[i + 3] == 0xFC) {
-			sprintf(output->model, "%.13s", &data[i + 5]);
-
-			// Monitor names are terminated by newline if they're too short
-			char *nl = strchr(output->model, '\n');
-			if (nl) {
-				*nl = '\0';
-			}
-		} else if (flag == 0 && data[i + 3] == 0xFF) {
-			sprintf(output->serial, "%.13s", &data[i + 5]);
-
-			// Monitor serial numbers are terminated by newline if they're too
-			// short
-			char *nl = strchr(output->serial, '\n');
-			if (nl) {
-				*nl = '\0';
-			}
-		}
-	}
-}
-
 bool drm_set_refresh( struct drm_t *drm, int refresh )
 {
-	int width = g_nOutputWidth;
-	int height = g_nOutputHeight;
-	if ( g_bRotated ) {
-		int tmp = width;
-		width = height;
-		height = tmp;
-	}
-
 	drmModeConnector *connector = drm->connector->connector;
-	const drmModeModeInfo *existing_mode = find_mode(connector, width, height, refresh);
-	drmModeModeInfo mode = {0};
+	const drmModeModeInfo *existing_mode = find_mode(connector, g_nOutputWidth, g_nOutputHeight, refresh);
+	drmModeModeInfo mode;
 	if ( existing_mode )
 	{
 		mode = *existing_mode;
@@ -1723,44 +1296,8 @@ bool drm_set_refresh( struct drm_t *drm, int refresh )
 	else
 	{
 		/* TODO: check refresh is within the EDID limits */
-		switch ( g_drmModeGeneration )
-		{
-		case DRM_MODE_GENERATE_CVT:
-			generate_cvt_mode( &mode, width, height, refresh, true, false );
-			break;
-		case DRM_MODE_GENERATE_FIXED:
-			{
-				bool is_steam_deck_display = false;
-				if ( drm->connector->props.find( "EDID" ) != drm->connector->props.end() )
-				{
-					uint64_t blob_id = drm->connector->initial_prop_values["EDID"];
-
-					drmModePropertyBlobRes *blob = drmModeGetPropertyBlob(drm->fd, blob_id);
-					if (blob) {
-						edid_data_t edid_data = {};
-						parse_edid( &edid_data, (const unsigned char *)blob->data, blob->length );
-
-						is_steam_deck_display = 
-							( edid_data.make == EDID_ID( 'W', 'L', 'C' ) && !strncmp( edid_data.model, "ANX7530 U", sizeof( edid_data.model ) ) ) ||
-							( edid_data.make == EDID_ID( 'A', 'N', 'X' ) && !strncmp( edid_data.model, "ANX7530 U", sizeof( edid_data.model ) ) ) ||
-							( edid_data.make == EDID_ID( 'V', 'L', 'V' ) && !strncmp( edid_data.model, "Jupiter", sizeof( edid_data.model ) ) );
-
-						drmModeFreePropertyBlob(blob);
-					}
-					else
-					{
-						drm_log.errorf_errno("drmModeGetPropertyBlob(EDID) failed");
-					}
-				}
-
-				const drmModeModeInfo *preferred_mode = find_mode(connector, 0, 0, 0);
-				generate_fixed_mode( &mode, preferred_mode, refresh, is_steam_deck_display );
-				break;
-			}
-		}
+		generate_cvt_mode( &mode, g_nOutputWidth, g_nOutputHeight, refresh, true, false );
 	}
-
-	mode.type = DRM_MODE_TYPE_USERDEF;
 
 	return drm_set_mode(drm, &mode);
 }
@@ -1775,20 +1312,4 @@ bool drm_set_resolution( struct drm_t *drm, int width, int height )
 	}
 
 	return drm_set_mode(drm, mode);
-}
-
-int drm_get_default_refresh(struct drm_t *drm)
-{
-	if ( drm->preferred_refresh )
-		return drm->preferred_refresh;
-
-	if ( drm->connector && drm->connector->connector )
-	{
-		drmModeConnector *connector = drm->connector->connector;
-		const drmModeModeInfo *mode = find_mode( connector, g_nOutputWidth, g_nOutputHeight, 0);
-		if ( mode )
-			return mode->vrefresh;
-	}
-
-	return 60;
 }

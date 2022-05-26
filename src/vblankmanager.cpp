@@ -1,12 +1,9 @@
 // Try to figure out when vblank is and notify steamcompmgr to render some time before it
 
-#include <cstdint>
-#include <mutex>
 #include <thread>
 #include <vector>
 #include <chrono>
 #include <atomic>
-#include <condition_variable>
 
 #include <assert.h>
 #include <fcntl.h>
@@ -23,98 +20,19 @@ static int g_vblankPipe[2];
 
 std::atomic<uint64_t> g_lastVblank;
 
-// 3ms by default -- a good starting value.
-const uint64_t g_uStartingDrawTime = 3'000'000;
-
-// This is the last time a draw took.
-std::atomic<uint64_t> g_uVblankDrawTimeNS = { g_uStartingDrawTime };
-
-// 1.3ms by default. (g_uDefaultMinVBlankTime)
-// This accounts for some time we cannot account for (which (I think) is the drm_commit -> triggering the pageflip)
-// It would be nice to make this lower if we can find a way to track that effectively
-// Perhaps the missing time is spent elsewhere, but given we track from the pipe write
-// to after the return from `drm_commit` -- I am very doubtful.
-uint64_t g_uMinVblankTime = g_uDefaultMinVBlankTime;
-
-// Tuneable
-// 0.3ms by default. (g_uDefaultVBlankRedZone)
-// This is the leeway we always apply to our buffer.
-uint64_t g_uVblankDrawBufferRedZoneNS = g_uDefaultVBlankRedZone;
-
-// Tuneable
-// 93% by default. (g_uVBlankRateOfDecayPercentage)
-// The rate of decay (as a percentage) of the rolling average -> current draw time
-uint64_t g_uVBlankRateOfDecayPercentage = g_uDefaultVBlankRateOfDecayPercentage;
-
-const uint64_t g_uVBlankRateOfDecayMax = 1000;
-
-static std::atomic<uint64_t> g_uRollingMaxDrawTime = { g_uStartingDrawTime };
-
-//#define VBLANK_DEBUG
+uint64_t g_uVblankDrawBufferNS = 5'000'000;
 
 void vblankThreadRun( void )
 {
-	pthread_setname_np( pthread_self(), "gamescope-vblk" );
-
-	// Start off our average with our starting draw time.
-	uint64_t rollingMaxDrawTime = g_uStartingDrawTime;
-
-	const uint64_t range = g_uVBlankRateOfDecayMax;
 	while ( true )
 	{
-		const uint64_t alpha = g_uVBlankRateOfDecayPercentage;
-		const int refresh = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+		uint64_t lastVblank = g_lastVblank - g_uVblankDrawBufferNS;
+		uint64_t nsecInterval = 1'000'000'000ul / g_nOutputRefresh;
 
-		const uint64_t nsecInterval = 1'000'000'000ul / refresh;
-		const uint64_t drawTime = g_uVblankDrawTimeNS;
-
-		// This is a rolling average when drawTime < rollingMaxDrawTime,
-		// and a a max when drawTime > rollingMaxDrawTime.
-		// This allows us to deal with spikes in the draw buffer time very easily.
-		// eg. if we suddenly spike up (eg. because of test commits taking a stupid long time),
-		// we will then be able to deal with spikes in the long term, even if several commits after
-		// we get back into a good state and then regress again.
-
-		// If we go over half of our deadzone, be more defensive about things.
-		if ( int64_t(drawTime) - int64_t(g_uVblankDrawBufferRedZoneNS / 2) > int64_t(rollingMaxDrawTime) )
-			rollingMaxDrawTime = drawTime;
-		else
-			rollingMaxDrawTime = ( ( alpha * rollingMaxDrawTime ) + ( range - alpha ) * drawTime ) / range;
-
-		// If we need to offset for our draw more than half of our vblank, something is very wrong.
-		// Clamp our max time to half of the vblank if we can.
-		rollingMaxDrawTime = std::min( rollingMaxDrawTime, nsecInterval - g_uVblankDrawBufferRedZoneNS );
-
-		g_uRollingMaxDrawTime = rollingMaxDrawTime;
-
-		uint64_t offset = rollingMaxDrawTime + g_uVblankDrawBufferRedZoneNS;
-
-#ifdef VBLANK_DEBUG
-		// Debug stuff for logging missed vblanks
-		static uint64_t vblankIdx = 0;
-		static uint64_t lastDrawTime = g_uVblankDrawTimeNS;
-		static uint64_t lastOffset = g_uVblankDrawTimeNS + g_uVblankDrawBufferRedZoneNS;
-
-		if ( vblankIdx++ % 300 == 0 || drawTime > lastOffset )
+		if ( g_nNestedRefresh != 0 )
 		{
-			if ( drawTime > lastOffset )
-				fprintf( stderr, " !! missed vblank " );
-
-			fprintf( stderr, "redZone: %.2fms decayRate: %lu%% - rollingMaxDrawTime: %.2fms lastDrawTime: %.2fms lastOffset: %.2fms - drawTime: %.2fms offset: %.2fms\n",
-				g_uVblankDrawBufferRedZoneNS / 1'000'000.0,
-				g_uVBlankRateOfDecayPercentage,
-				rollingMaxDrawTime / 1'000'000.0,
-				lastDrawTime / 1'000'000.0,
-				lastOffset / 1'000'000.0,
-				drawTime / 1'000'000.0,
-				offset / 1'000'000.0 );
+			nsecInterval = 1'000'000'000ul / g_nNestedRefresh;
 		}
-
-		lastDrawTime = drawTime;
-		lastOffset = offset;
-#endif
-
-		uint64_t lastVblank = g_lastVblank - offset;
 
 		uint64_t now = get_time_in_nanos();
 		uint64_t targetPoint = lastVblank + nsecInterval;
@@ -137,7 +55,7 @@ void vblankThreadRun( void )
 		}
 		
 		// Get on the other side of it now
-		sleep_for_nanos( offset + 1'000'000 );
+		sleep_for_nanos( g_uVblankDrawBufferNS + 1'000'000 );
 	}
 }
 
@@ -157,7 +75,7 @@ int vblank_init( void )
 	return g_vblankPipe[ 0 ];
 }
 
-void vblank_mark_possible_vblank( uint64_t nanos )
+void vblank_mark_possible_vblank( void )
 {
-	g_lastVblank = nanos;
+	g_lastVblank = get_time_in_nanos();
 }

@@ -1,14 +1,11 @@
 #include <X11/Xlib.h>
 
-#include <cstdio>
 #include <thread>
 #include <mutex>
 #include <vector>
 #include <cstring>
 #include <sys/capability.h>
 #include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/resource.h>
 
 #include <getopt.h>
 #include <signal.h>
@@ -39,11 +36,6 @@ const struct option *gamescope_options = (struct option[]){
 	{ "output-width", required_argument, nullptr, 'W' },
 	{ "output-height", required_argument, nullptr, 'H' },
 	{ "nearest-neighbor-filter", no_argument, nullptr, 'n' },
-	{ "fsr-upscaling", no_argument, nullptr, 'U' },
-	{ "nis-upscaling", no_argument, nullptr, 'Y' },
-	{ "sharpness", required_argument, nullptr, 0 },
-	{ "fsr-sharpness", required_argument, nullptr, 0 },
-	{ "rt", no_argument, nullptr, 0 },
 
 	// nested mode options
 	{ "nested-unfocused-refresh", required_argument, nullptr, 'o' },
@@ -55,14 +47,9 @@ const struct option *gamescope_options = (struct option[]){
 	{ "debug-layers", no_argument, nullptr, 0 },
 	{ "prefer-output", required_argument, nullptr, 'O' },
 	{ "default-touch-mode", required_argument, nullptr, 0 },
-	{ "generate-drm-mode", required_argument, nullptr, 0 },
-
-	// wlserver options
-	{ "xwayland-count", required_argument, nullptr, 0 },
 
 	// steamcompmgr options
 	{ "cursor", required_argument, nullptr, 0 },
-	{ "cursor-hotspot", required_argument, nullptr, 0 },
 	{ "ready-fd", required_argument, nullptr, 'R' },
 	{ "stats-path", required_argument, nullptr, 'T' },
 	{ "hide-cursor-delay", required_argument, nullptr, 'C' },
@@ -72,9 +59,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "debug-events", no_argument, nullptr, 0 },
 	{ "steam", no_argument, nullptr, 'e' },
 	{ "force-composition", no_argument, nullptr, 'c' },
-	{ "composite-debug", no_argument, nullptr, 0 },
 	{ "disable-xres", no_argument, nullptr, 'x' },
-	{ "fade-out-duration", required_argument, nullptr, 0 },
 
 	{} // keep last
 };
@@ -92,16 +77,11 @@ const char usage[] =
 	"  -W, --output-width             output width\n"
 	"  -H, --output-height            output height\n"
 	"  -n, --nearest-neighbor-filter  use nearest neighbor filtering\n"
-	"  -U  --fsr-upscaling            use AMD FidelityFX™ Super Resolution 1.0 for upscaling\n"
-	"  -Y  --nis-upscaling            use NVIDIA Image Scaling v1.0.2 for upscaling\n"
-	"  --sharpness --fsr-sharpness    upscaler sharpness from 0 (max) to 20 (min)\n"
 	"  --cursor                       path to default cursor image\n"
 	"  -R, --ready-fd                 notify FD when ready\n"
-	"  --rt                           Use realtime scheduling\n"
 	"  -T, --stats-path               write statistics to path\n"
 	"  -C, --hide-cursor-delay        hide cursor image after delay\n"
 	"  -e, --steam                    enable Steam integration\n"
-	" --xwayland-count                create N xwayland servers\n"
 	"\n"
 	"Nested mode options:\n"
 	"  -o, --nested-unfocused-refresh game refresh rate when unfocused\n"
@@ -111,7 +91,6 @@ const char usage[] =
 	"Embedded mode options:\n"
 	"  -O, --prefer-output            list of connectors in order of preference\n"
 	"  --default-touch-mode           0: hover, 1: left, 2: right, 3: middle, 4: passthrough\n"
-	"  --generate-drm-mode            DRM mode generation algorithm (cvt, fixed)\n"
 	"\n"
 	"Debug options:\n"
 	"  --disable-layers               disable libliftoff (hardware planes)\n"
@@ -121,16 +100,11 @@ const char usage[] =
 	"  --debug-hud                    paint HUD with debug info\n"
 	"  --debug-events                 debug X11 events\n"
 	"  --force-composition            disable direct scan-out\n"
-	"  --composite-debug              draw frame markers on alternating corners of the screen when compositing\n"
 	"  --disable-xres                 disable XRes for PID lookup\n"
 	"\n"
 	"Keyboard shortcuts:\n"
 	"  Super + F                      toggle fullscreen\n"
 	"  Super + N                      toggle nearest neighbour filtering\n"
-	"  Super + U                      toggle FSR upscaling\n"
-	"  Super + Y                      toggle NIS upscaling\n"
-	"  Super + I                      increase FSR sharpness by 1\n"
-	"  Super + O                      decrease FSR sharpness by 1\n"
 	"  Super + S                      take a screenshot\n"
 	"";
 
@@ -150,20 +124,12 @@ bool g_bFullscreen = false;
 bool g_bIsNested = false;
 
 bool g_bFilterGameWindow = true;
-GamescopeUpscaler g_upscaler = GamescopeUpscaler::BLIT;
-int g_upscalerSharpness = 2;
 
 bool g_bBorderlessOutputWindow = false;
-
-int g_nXWaylandCount = 1;
 
 bool g_bNiceCap = false;
 int g_nOldNice = 0;
 int g_nNewNice = 0;
-
-bool g_bRt = false;
-int g_nOldPolicy;
-struct sched_param g_schedOldParam;
 
 float g_flMaxWindowScale = FLT_MAX;
 bool g_bIntegerScale = false;
@@ -196,18 +162,6 @@ static std::string build_optstring(const struct option *options)
 	return optstring;
 }
 
-static enum drm_mode_generation parse_drm_mode_generation(const char *str)
-{
-	if (strcmp(str, "cvt") == 0) {
-		return DRM_MODE_GENERATE_CVT;
-	} else if (strcmp(str, "fixed") == 0) {
-		return DRM_MODE_GENERATE_FIXED;
-	} else {
-		fprintf( stderr, "gamescope: invalid value for --generate-drm-mode\n" );
-		exit(1);
-	}
-}
-
 static void handle_signal( int sig )
 {
 	switch ( sig ) {
@@ -224,57 +178,10 @@ static void handle_signal( int sig )
 	}
 }
 
-static struct rlimit g_originalFdLimit;
-static bool g_fdLimitRaised = false;
-
-void restore_fd_limit( void )
-{
-	if (!g_fdLimitRaised) {
-		return;
-	}
-
-	if ( setrlimit( RLIMIT_NOFILE, &g_originalFdLimit ) )
-	{
-		fprintf( stderr, "Failed to reset the maximum number of open files in child process\n" );
-		fprintf( stderr, "Use of select() may fail.\n" );
-	}
-
-	g_fdLimitRaised = false;
-}
-
-static void raise_fd_limit( void )
-{
-	struct rlimit newFdLimit;
-
-	memset(&g_originalFdLimit, 0, sizeof(g_originalFdLimit));
-	if ( getrlimit( RLIMIT_NOFILE, &g_originalFdLimit ) != 0 )
-	{
-		fprintf( stderr, "Could not query maximum number of open files. Leaving at default value.\n" );
-		return;
-	}
-
-	if ( g_originalFdLimit.rlim_cur >= g_originalFdLimit.rlim_max )
-	{
-		return;
-	}
-
-	memcpy(&newFdLimit, &g_originalFdLimit, sizeof(newFdLimit));
-	newFdLimit.rlim_cur = newFdLimit.rlim_max;
-
-	if ( setrlimit( RLIMIT_NOFILE, &newFdLimit ) )
-	{
-		fprintf( stderr, "Failed to raise the maximum number of open files. Leaving at default value.\n" );
-	}
-
-	g_fdLimitRaised = true;
-}
-
-int g_nPreferredOutputWidth = 0;
-int g_nPreferredOutputHeight = 0;
-
 int main(int argc, char **argv)
 {
-
+	int nPreferredOutputWidth = 0;
+	int nPreferredOutputHeight = 0;
 
 	static std::string optstring = build_optstring(gamescope_options);
 	gamescope_optstring = optstring.c_str();
@@ -295,10 +202,10 @@ int main(int argc, char **argv)
 				g_nNestedRefresh = atoi( optarg );
 				break;
 			case 'W':
-				g_nPreferredOutputWidth = atoi( optarg );
+				nPreferredOutputWidth = atoi( optarg );
 				break;
 			case 'H':
-				g_nPreferredOutputHeight = atoi( optarg );
+				nPreferredOutputHeight = atoi( optarg );
 				break;
 			case 'o':
 				g_nNestedUnfocusedRefresh = atoi( optarg );
@@ -321,12 +228,6 @@ int main(int argc, char **argv)
 			case 'O':
 				g_sOutputName = optarg;
 				break;
-			case 'U':
-				g_upscaler = GamescopeUpscaler::FSR;
-				break;
-			case 'Y':
-				g_upscaler = GamescopeUpscaler::NIS;
-				break;
 			case 0: // long options without a short option
 				opt_name = gamescope_options[opt_index].name;
 				if (strcmp(opt_name, "help") == 0) {
@@ -336,20 +237,9 @@ int main(int argc, char **argv)
 					g_bUseLayers = false;
 				} else if (strcmp(opt_name, "debug-layers") == 0) {
 					g_bDebugLayers = true;
-				} else if (strcmp(opt_name, "xwayland-count") == 0) {
-					g_nXWaylandCount = atoi( optarg );
-				} else if (strcmp(opt_name, "composite-debug") == 0) {
-					g_bIsCompositeDebug = true;
 				} else if (strcmp(opt_name, "default-touch-mode") == 0) {
 					g_nDefaultTouchClickMode = (enum wlserver_touch_click_mode) atoi( optarg );
 					g_nTouchClickMode = g_nDefaultTouchClickMode;
-				} else if (strcmp(opt_name, "generate-drm-mode") == 0) {
-					g_drmModeGeneration = parse_drm_mode_generation( optarg );
-				} else if (strcmp(opt_name, "sharpness") == 0 ||
-						   strcmp(opt_name, "fsr-sharpness") == 0) {
-					g_upscalerSharpness = atoi( optarg );
-				} else if (strcmp(opt_name, "rt") == 0) {
-					g_bRt = true;
 				}
 				break;
 			case '?':
@@ -381,19 +271,6 @@ int main(int argc, char **argv)
 			{
 				g_nNewNice = nNewNice;
 			}
-			if ( g_bRt )
-			{
-				struct sched_param sched;
-				sched_getparam(0, &sched);
-				sched.sched_priority = sched_get_priority_min(SCHED_RR);
-
-				if (pthread_getschedparam(pthread_self(), &g_nOldPolicy, &g_schedOldParam)) {
-					fprintf(stderr, "Failed to get old scheduling parameters: %s", strerror(errno));
-					exit(1);
-				}
-				if (sched_setscheduler(0, SCHED_RR, &sched))
-					fprintf(stderr, "Failed to set realtime: %s", strerror(errno));
-			}
 		}
 	}
 
@@ -401,10 +278,6 @@ int main(int argc, char **argv)
 	{
 		fprintf( stderr, "No CAP_SYS_NICE, falling back to regular-priority compute and threads.\nPerformance will be affected.\n" );
 	}
-
-	setenv( "XWAYLAND_FORCE_ENABLE_EXTRA_MODES", "1", 1 );
-
-	raise_fd_limit();
 
 	if ( gpuvis_trace_init() != -1 )
 	{
@@ -440,7 +313,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if ( !initOutput( g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh ) )
+	if ( !initOutput( nPreferredOutputWidth, nPreferredOutputHeight, g_nNestedRefresh ) )
 	{
 		fprintf( stderr, "Failed to initialize output\n" );
 		return 1;
@@ -497,24 +370,8 @@ int main(int argc, char **argv)
 		fprintf( stderr, "Failed to initialize wlserver\n" );
 		return 1;
 	}
-	
-	gamescope_xwayland_server_t *base_server = wlserver_get_xwayland_server(0);
 
-	setenv("DISPLAY", base_server->get_nested_display_name(), 1);
-	if (g_nXWaylandCount > 1)
-	{
-		for (int i = 1; i < g_nXWaylandCount; i++)
-		{
-			char env_name[64];
-			snprintf(env_name, sizeof(env_name), "STEAM_GAME_DISPLAY_%d", i - 1);
-			gamescope_xwayland_server_t *server = wlserver_get_xwayland_server(i);
-			setenv(env_name, server->get_nested_display_name(), 1);
-		}
-	}
-	else
-	{
-		setenv("STEAM_GAME_DISPLAY_0", base_server->get_nested_display_name(), 1);
-	}
+	setenv("DISPLAY", wlserver_get_nested_display_name(), 1);
 	setenv("GAMESCOPE_WAYLAND_DISPLAY", wlserver_get_wl_display_name(), 1);
 
 #if HAVE_PIPEWIRE
@@ -537,8 +394,6 @@ int main(int argc, char **argv)
 
 static void steamCompMgrThreadRun(int argc, char **argv)
 {
-	pthread_setname_np( pthread_self(), "gamescope-xwm" );
-
 	steamcompmgr_main( argc, argv );
 
 	pthread_kill( g_mainThread, SIGINT );
@@ -572,4 +427,19 @@ static bool initOutput( int preferredWidth, int preferredHeight, int preferredRe
 	{
 		return init_drm( &g_DRM, preferredWidth, preferredHeight, preferredRefresh );
 	}
+}
+
+void wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf)
+{
+	{
+		std::lock_guard<std::mutex> lock( wayland_commit_lock );
+
+		ResListEntry_t newEntry = {
+			.surf = surf,
+			.buf = buf,
+		};
+		wayland_commit_queue.push_back( newEntry );
+	}
+
+	nudge_steamcompmgr();
 }

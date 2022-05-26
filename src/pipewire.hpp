@@ -1,10 +1,7 @@
 #pragma once
 
-#include <memory>
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
-
-#include "rendervulkan.hpp"
 
 struct pipewire_state {
 	struct pw_loop *loop;
@@ -15,9 +12,9 @@ struct pipewire_state {
 	struct pw_stream *stream;
 	uint32_t stream_node_id;
 	bool streaming;
+	bool needs_buffer;
 	struct spa_video_info_raw video_info;
-	bool dmabuf;
-	int shm_stride;
+	int stride;
 	uint64_t seq;
 };
 
@@ -27,16 +24,10 @@ struct pipewire_state {
  * push_pipewire_buffer) for copying.
  */
 struct pipewire_buffer {
-	enum spa_data_type type; // SPA_DATA_MemFd or SPA_DATA_DmaBuf
 	struct spa_video_info_raw video_info;
-	std::shared_ptr<CVulkanTexture> texture;
-
-	// Only used for SPA_DATA_MemFd
-	struct {
-		int stride;
-		uint8_t *data;
-		int fd;
-	} shm;
+	int stride;
+	uint8_t *data;
+	int fd;
 
 	// The following fields are not thread-safe
 

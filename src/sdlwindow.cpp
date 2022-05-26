@@ -13,8 +13,6 @@
 
 #include "sdlscancodetable.hpp"
 
-#define DEFAULT_TITLE "gamescope"
-
 static bool g_bSDLInitOK = false;
 static std::mutex g_SDLInitLock;
 
@@ -26,10 +24,6 @@ static bool g_bWindowFocused = true;
 SDL_Window *g_SDLWindow;
 static uint32_t g_unSDLUserEventID;
 static SDL_Event g_SDLUserEvent;
-
-static std::mutex g_SDLWindowTitleLock;
-static std::string g_SDLWindowTitle;
-static bool g_bUpdateSDLWindowTitle = false;
 
 //-----------------------------------------------------------------------------
 // Purpose: Convert from the remote scancode to a Linux event keycode
@@ -50,8 +44,8 @@ static inline int SDLButtonToLinuxButton( int SDLButton )
 		case SDL_BUTTON_LEFT: return BTN_LEFT;
 		case SDL_BUTTON_MIDDLE: return BTN_MIDDLE;
 		case SDL_BUTTON_RIGHT: return BTN_RIGHT;
-		case SDL_BUTTON_X1: return BTN_SIDE;
-		case SDL_BUTTON_X2: return BTN_EXTRA;
+		case SDL_BUTTON_X1: return BTN_FORWARD;
+		case SDL_BUTTON_X2: return BTN_BACK;
 		default: return 0;
 	}
 }
@@ -90,7 +84,7 @@ void inputSDLThreadRun( void )
 		nSDLWindowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 	}
 
-	g_SDLWindow = SDL_CreateWindow( DEFAULT_TITLE,
+	g_SDLWindow = SDL_CreateWindow( "gamescope",
 							   SDL_WINDOWPOS_UNDEFINED,
 							SDL_WINDOWPOS_UNDEFINED,
 							g_nOutputWidth,
@@ -116,12 +110,9 @@ void inputSDLThreadRun( void )
 		switch( event.type )
 		{
 			case SDL_MOUSEMOTION:
-				if ( g_bWindowFocused )
-				{
-					wlserver_lock();
-					wlserver_mousemotion( event.motion.xrel, event.motion.yrel, event.motion.timestamp );
-					wlserver_unlock();
-				}
+				wlserver_lock();
+				wlserver_mousemotion( event.motion.xrel, event.motion.yrel, event.motion.timestamp );
+				wlserver_unlock();
 				break;
 			case SDL_MOUSEBUTTONDOWN:
 			case SDL_MOUSEBUTTONUP:
@@ -152,23 +143,6 @@ void inputSDLThreadRun( void )
 						case KEY_N:
 							g_bFilterGameWindow = !g_bFilterGameWindow;
 							break;
-						case KEY_B:
-							g_upscaler = GamescopeUpscaler::BLIT;
-							break;
-						case KEY_U:
-							g_upscaler = (g_upscaler == GamescopeUpscaler::FSR) ?
-								GamescopeUpscaler::BLIT : GamescopeUpscaler::FSR;
-							break;
-						case KEY_Y:
-							g_upscaler = (g_upscaler == GamescopeUpscaler::NIS) ? 
-								GamescopeUpscaler::BLIT : GamescopeUpscaler::NIS;
-							break;
-						case KEY_I:
-							g_upscalerSharpness = std::min(20, g_upscalerSharpness + 1);
-							break;
-						case KEY_O:
-							g_upscalerSharpness = std::max(0, g_upscalerSharpness - 1);
-							break;
 						case KEY_S:
 							take_screenshot();
 							break;
@@ -192,10 +166,6 @@ void inputSDLThreadRun( void )
 			case SDL_WINDOWEVENT:
 				switch( event.window.event )
 				{
-					case SDL_WINDOWEVENT_CLOSE:
-						g_bRun = false;
-						nudge_steamcompmgr();
-						break;
 					default:
 						break;
 					case SDL_WINDOWEVENT_MOVED:
@@ -242,23 +212,11 @@ bool sdlwindow_init( void )
 	return g_bSDLInitOK;
 }
 
-extern bool steamMode;
-extern bool g_bFirstFrame;
-
 void sdlwindow_update( void )
 {
-	bool should_show = hasFocusWindow;
-
-	// If we are Steam Mode in nested, show the window
-	// whenever we have had a first frame to match
-	// what we do in embedded with Steam for testing
-	// held commits, etc.
-	if ( steamMode )
-		should_show |= !g_bFirstFrame;
-
-	if ( g_bWindowShown != should_show )
+	if ( g_bWindowShown != hasFocusWindow )
 	{
-		g_bWindowShown = should_show;
+		g_bWindowShown = hasFocusWindow;
 
 		if ( g_bWindowShown )
 		{
@@ -269,36 +227,9 @@ void sdlwindow_update( void )
 			SDL_HideWindow( g_SDLWindow );
 		}
 	}
-
-	g_SDLWindowTitleLock.lock();
-	if ( g_bUpdateSDLWindowTitle )
-	{
-		g_bUpdateSDLWindowTitle = false;
-		SDL_SetWindowTitle( g_SDLWindow, g_SDLWindowTitle.c_str() );
-	}
-	g_SDLWindowTitleLock.unlock();
-}
-
-void sdlwindow_title( const char* title )
-{
-	if ( !BIsNested() )
-		return;
-
-	title = title ? title : DEFAULT_TITLE;
-	g_SDLWindowTitleLock.lock();
-	if ( g_SDLWindowTitle != title )
-	{
-		g_SDLWindowTitle = title ? title : DEFAULT_TITLE;
-		g_bUpdateSDLWindowTitle = true;
-		sdlwindow_pushupdate();
-	}
-	g_SDLWindowTitleLock.unlock();
 }
 
 void sdlwindow_pushupdate( void )
 {
-	if ( !BIsNested() )
-		return;
-
 	SDL_PushEvent( &g_SDLUserEvent );
 }

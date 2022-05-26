@@ -1,4 +1,3 @@
-#include <xkbcommon/xkbcommon-keysyms.h>
 #define _GNU_SOURCE 1
 
 #include <assert.h>
@@ -6,7 +5,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <string.h>
-#include <poll.h>	
+#include <poll.h>
+
+#include <map>
 
 #include <linux/input-event-codes.h>
 
@@ -22,6 +23,7 @@ extern "C" {
 #include <wlr/backend/headless.h>
 #include <wlr/backend/multi.h>
 #include <wlr/backend/libinput.h>
+#include <wlr/backend/noop.h>
 #include <wlr/interfaces/wlr_input_device.h>
 #include <wlr/interfaces/wlr_keyboard.h>
 #include <wlr/render/wlr_renderer.h>
@@ -43,7 +45,6 @@ extern "C" {
 #include "steamcompmgr.hpp"
 #include "log.hpp"
 #include "ime.hpp"
-#include "xwayland_ctx.hpp"
 
 #if HAVE_PIPEWIRE
 #include "pipewire.hpp"
@@ -55,45 +56,26 @@ static LogScope wl_log("wlserver");
 
 static struct wlserver_t wlserver = {};
 
+static Display *g_XWLDpy = nullptr;
+
 struct wlserver_content_override {
 	struct wlr_surface *surface;
 	uint32_t x11_window;
 	struct wl_listener surface_destroy_listener;
 };
 
+static std::map<uint32_t, struct wlserver_content_override *> content_overrides;
+
 enum wlserver_touch_click_mode g_nDefaultTouchClickMode = WLSERVER_TOUCH_CLICK_LEFT;
 enum wlserver_touch_click_mode g_nTouchClickMode = g_nDefaultTouchClickMode;
 
 static struct wl_list pending_surfaces = {0};
 
+static bool bXwaylandReady = false;
+
 static void wlserver_surface_set_wlr( struct wlserver_surface *surf, struct wlr_surface *wlr_surf );
 
 extern const struct wlr_surface_role xwayland_surface_role;
-
-std::vector<ResListEntry_t> gamescope_xwayland_server_t::retrieve_commits()
-{
-	std::vector<ResListEntry_t> commits;
-	{
-		std::lock_guard<std::mutex> lock( wayland_commit_lock );
-		commits = std::move(wayland_commit_queue);
-	}
-	return commits;
-}
-
-void gamescope_xwayland_server_t::wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf)
-{
-	{
-		std::lock_guard<std::mutex> lock( wayland_commit_lock );
-
-		ResListEntry_t newEntry = {
-			.surf = surf,
-			.buf = buf,
-		};
-		wayland_commit_queue.push_back( newEntry );
-	}
-
-	nudge_steamcompmgr();
-}
 
 void xwayland_surface_role_commit(struct wlr_surface *wlr_surface) {
 	assert(wlr_surface->role == &xwayland_surface_role);
@@ -108,9 +90,7 @@ void xwayland_surface_role_commit(struct wlr_surface *wlr_surface) {
 
 	gpuvis_trace_printf( "xwayland_surface_role_commit wlr_surface %p", wlr_surface );
 
-	gamescope_xwayland_server_t *server = (gamescope_xwayland_server_t *)wlr_surface->data;
-	assert(server);
-	server->wayland_commit( wlr_surface, buf );
+	wayland_commit( wlr_surface, buf );
 }
 
 static void xwayland_surface_role_precommit(struct wlr_surface *wlr_surface) {
@@ -127,21 +107,12 @@ const struct wlr_surface_role xwayland_surface_role = {
 	.precommit = xwayland_surface_role_precommit,
 };
 
-void gamescope_xwayland_server_t::on_xwayland_ready(void *data)
+static void xwayland_ready(struct wl_listener *listener, void *data)
 {
-	xwayland_ready = true;
-
-	if (!xwayland_server->options.no_touch_pointer_emulation)
-		wl_log.infof("Xwayland doesn't support -noTouchPointerEmulation, touch events might get duplicated");
-
-	dpy = XOpenDisplay( get_nested_display_name() );
+	bXwaylandReady = true;
 }
 
-void gamescope_xwayland_server_t::xwayland_ready_callback(struct wl_listener *listener, void *data)
-{
-	gamescope_xwayland_server_t *server = wl_container_of( listener, server, xwayland_ready_listener );
-	server->on_xwayland_ready(data);
-}
+struct wl_listener xwayland_ready_listener = { .notify = xwayland_ready };
 
 static void bump_input_counter()
 {
@@ -171,21 +142,6 @@ static void wlserver_handle_key(struct wl_listener *listener, void *data)
 		unsigned vt = keysym - XKB_KEY_XF86Switch_VT_1 + 1;
 		wlr_session_change_vt(wlserver.wlr.session, vt);
 		return;
-	}
-
-	if ( ( event->state == WL_KEYBOARD_KEY_STATE_PRESSED || event->state == WL_KEYBOARD_KEY_STATE_RELEASED ) && ( keysym == XKB_KEY_XF86AudioLowerVolume || keysym == XKB_KEY_XF86AudioRaiseVolume ) )
-	{
-		// Always send volume+/- to root server only, to avoid it reaching the game.
-		struct wlr_surface *old_kb_surf = wlserver.kb_focus_surface;
-		struct wlr_surface *new_kb_surf = steamcompmgr_get_server_input_surface( 0 );
-		if ( new_kb_surf )
-		{
-			wlserver_keyboardfocus( new_kb_surf );
-			wlr_seat_set_keyboard( wlserver.wlr.seat, keyboard->device );
-			wlr_seat_keyboard_notify_key( wlserver.wlr.seat, event->time_msec, event->keycode, event->state );
-			wlserver_keyboardfocus( old_kb_surf );
-			return;
-		}
 	}
 
 	wlr_seat_set_keyboard( wlserver.wlr.seat, keyboard->device);
@@ -262,18 +218,16 @@ static inline uint32_t steamcompmgr_button_to_wlserver_button( int button )
 	switch ( button )
 	{
 		default:
-		case WLSERVER_TOUCH_CLICK_HOVER:
+		case 0:
 			return 0;
-		case WLSERVER_TOUCH_CLICK_LEFT:
+		case 1:
 			return BTN_LEFT;
-		case WLSERVER_TOUCH_CLICK_RIGHT:
+		case 2:
 			return BTN_RIGHT;
-		case WLSERVER_TOUCH_CLICK_MIDDLE:
+		case 3:
 			return BTN_MIDDLE;
 	}
 }
-
-std::atomic<bool> g_bPendingTouchMovement = { false };
 
 static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
 {
@@ -294,6 +248,12 @@ static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
 		x *= focusedWindowScaleX;
 		y *= focusedWindowScaleY;
 
+		if ( x < 0.0f ) x = 0.0f;
+		if ( y < 0.0f ) y = 0.0f;
+
+		if ( x > wlserver.mouse_focus_surface->current.width ) x = wlserver.mouse_focus_surface->current.width;
+		if ( y > wlserver.mouse_focus_surface->current.height ) y = wlserver.mouse_focus_surface->current.height;
+
 		wlserver.mouse_surface_cursorx = x;
 		wlserver.mouse_surface_cursory = y;
 
@@ -307,14 +267,8 @@ static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
 				wlserver.touch_down[ event->touch_id ] = true;
 			}
 		}
-		else if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_DISABLED )
-		{
-			return;
-		}
 		else
 		{
-			g_bPendingTouchMovement = true;
-
 			wlr_seat_pointer_notify_motion( wlserver.wlr.seat, event->time_msec, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
 			wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 
@@ -391,6 +345,12 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
 		x *= focusedWindowScaleX;
 		y *= focusedWindowScaleY;
 
+		if ( x < 0.0f ) x = 0.0f;
+		if ( y < 0.0f ) y = 0.0f;
+
+		if ( x > wlserver.mouse_focus_surface->current.width ) x = wlserver.mouse_focus_surface->current.width;
+		if ( y > wlserver.mouse_focus_surface->current.height ) y = wlserver.mouse_focus_surface->current.height;
+
 		wlserver.mouse_surface_cursorx = x;
 		wlserver.mouse_surface_cursory = y;
 
@@ -398,14 +358,8 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
 		{
 			wlr_seat_touch_notify_motion( wlserver.wlr.seat, event->time_msec, event->touch_id, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
 		}
-		else if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_DISABLED )
-		{
-			return;
-		}
 		else
 		{
-			g_bPendingTouchMovement = true;
-
 			wlr_seat_pointer_notify_motion( wlserver.wlr.seat, event->time_msec, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
 			wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 		}
@@ -504,7 +458,7 @@ static void wlserver_new_surface(struct wl_listener *l, void *data)
 
 static struct wl_listener new_surface_listener = { .notify = wlserver_new_surface };
 
-void gamescope_xwayland_server_t::destroy_content_override( struct wlserver_content_override *co )
+static void destroy_content_override( struct wlserver_content_override *co )
 {
 	wl_list_remove( &co->surface_destroy_listener.link );
 	content_overrides.erase( co->x11_window );
@@ -514,17 +468,10 @@ void gamescope_xwayland_server_t::destroy_content_override( struct wlserver_cont
 static void content_override_handle_surface_destroy( struct wl_listener *listener, void *data )
 {
 	struct wlserver_content_override *co = wl_container_of( listener, co, surface_destroy_listener );
-	assert(co->surface);
-	gamescope_xwayland_server_t *server = (gamescope_xwayland_server_t *)co->surface->data;
-	if (!server)
-	{
-		wl_log.errorf( "Unable to destroy content override for surface %p - was it launched on the wrong DISPLAY or did the surface never get wl_id?\n", co->surface );
-		return;
-	}
-	server->destroy_content_override( co );
+	destroy_content_override( co );
 }
 
-void gamescope_xwayland_server_t::handle_override_window_content( struct wl_client *client, struct wl_resource *resource, struct wl_resource *surface_resource, uint32_t x11_window )
+static void gamescope_xwayland_handle_override_window_content( struct wl_client *client, struct wl_resource *resource, struct wl_resource *surface_resource, uint32_t x11_window )
 {
 	struct wlr_surface *surface = wlr_surface_from_resource( surface_resource );
 
@@ -538,30 +485,6 @@ void gamescope_xwayland_server_t::handle_override_window_content( struct wl_clie
 	co->surface_destroy_listener.notify = content_override_handle_surface_destroy;
 	wl_signal_add( &surface->events.destroy, &co->surface_destroy_listener );
 	content_overrides[ x11_window ] = co;
-}
-
-struct wl_client *gamescope_xwayland_server_t::get_client()
-{
-	return xwayland_server->client;
-}
-
-static void gamescope_xwayland_handle_override_window_content( struct wl_client *client, struct wl_resource *resource, struct wl_resource *surface_resource, uint32_t x11_window )
-{
-	// This should ideally use the surface's xwayland, but we don't know it.
-	// We probably need to change our override_window_content protocol to add a
-	// xwayland socket name.
-	//
-	// Right now, the surface -> xwayland association comes from the
-	// handle_wl_id stuff from steamcompmgr.
-	// However, this surface has no associated X window, and won't recieve
-	// wl_id stuff as it's meant to replace another window's surface
-	// which we can't do without knowing the x11_window's xwayland server
-	// here for it to do that override logic in the first place.
-	//
-	// So... Just assume it comes from server 0 for now.
-	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server( 0 );
-	assert( server );
-	server->handle_override_window_content(client, resource, surface_resource, x11_window);
 }
 
 static void gamescope_xwayland_handle_destroy( struct wl_client *client, struct wl_resource *resource )
@@ -704,22 +627,6 @@ int wlsession_open_kms( const char *device_name ) {
 	return device->fd;
 }
 
-gamescope_xwayland_server_t::gamescope_xwayland_server_t(wl_display *display)
-{
-	struct wlr_xwayland_server_options xwayland_options = {
-		.lazy = false,
-		.enable_wm = false,
-		.no_touch_pointer_emulation = true,
-	};
-	xwayland_server = wlr_xwayland_server_create(display, &xwayland_options);
-	wl_signal_add(&xwayland_server->events.ready, &xwayland_ready_listener);
-}
-
-gamescope_xwayland_server_t::~gamescope_xwayland_server_t()
-{
-	wlr_xwayland_server_destroy(xwayland_server);
-}
-
 bool wlserver_init( void ) {
 	assert( wlserver.display != nullptr );
 
@@ -735,10 +642,10 @@ bool wlserver_init( void ) {
 
 	wl_signal_add( &wlserver.wlr.multi_backend->events.new_input, &new_input_listener );
 
-	wlserver.wlr.headless_backend = wlr_headless_backend_create( wlserver.display );
-	wlr_multi_backend_add( wlserver.wlr.multi_backend, wlserver.wlr.headless_backend );
+	wlserver.wlr.noop_backend = wlr_noop_backend_create( wlserver.display );
+	wlr_multi_backend_add( wlserver.wlr.multi_backend, wlserver.wlr.noop_backend );
 
-	wlserver.wlr.output = wlr_headless_add_output( wlserver.wlr.headless_backend, 1280, 720 );
+	wlserver.wlr.output = wlr_noop_add_output( wlserver.wlr.noop_backend );
 
 	if ( bIsDRM == True )
 	{
@@ -824,19 +731,26 @@ bool wlserver_init( void ) {
 
 	wlr_output_create_global( wlserver.wlr.output );
 
-	for (int i = 0; i < g_nXWaylandCount; i++)
-	{
-		auto server = std::make_unique<gamescope_xwayland_server_t>(wlserver.display);
+	struct wlr_xwayland_server_options xwayland_options = {
+		.lazy = false,
+		.enable_wm = false,
+	};
+	wlserver.wlr.xwayland_server = wlr_xwayland_server_create(wlserver.display, &xwayland_options);
+	wl_signal_add(&wlserver.wlr.xwayland_server->events.ready, &xwayland_ready_listener);
 
-		while (!server->is_xwayland_ready()) {
-			wl_display_flush_clients(wlserver.display);
-			if (wl_event_loop_dispatch(wlserver.event_loop, -1) < 0) {
-				wl_log.errorf("wl_event_loop_dispatch failed\n");
-				return false;
-			}
+	while (!bXwaylandReady) {
+		wl_display_flush_clients(wlserver.display);
+		if (wl_event_loop_dispatch(wlserver.event_loop, -1) < 0) {
+			wl_log.errorf("wl_event_loop_dispatch failed\n");
+			return false;
 		}
+	}
 
-		wlserver.wlr.xwayland_servers.emplace_back(std::move(server));
+	g_XWLDpy = XOpenDisplay( wlserver.wlr.xwayland_server->display_name );
+	if ( g_XWLDpy == nullptr )
+	{
+		wl_log.errorf( "Failed to connect to X11 server" );
+		return false;
 	}
 
 	return true;
@@ -854,8 +768,6 @@ void wlserver_unlock(void)
 	wl_display_flush_clients(wlserver.display);
 	pthread_mutex_unlock(&waylock);
 }
-
-extern std::mutex g_SteamCompMgrXWaylandServerMutex;
 
 void wlserver_run(void)
 {
@@ -891,11 +803,9 @@ void wlserver_run(void)
 		}
 	}
 
-	// Released when steamcompmgr closes.
-	std::unique_lock<std::mutex> xwayland_server_guard(g_SteamCompMgrXWaylandServerMutex);
 	// We need to shutdown Xwayland before disconnecting all clients, otherwise
 	// wlroots will restart it automatically.
-	wlserver.wlr.xwayland_servers.clear();
+	wlr_xwayland_server_destroy(wlserver.wlr.xwayland_server);
 	wl_display_destroy_clients(wlserver.display);
 	wl_display_destroy(wlserver.display);
 }
@@ -907,8 +817,6 @@ void wlserver_keyboardfocus( struct wlr_surface *surface )
 		wlr_seat_keyboard_notify_enter( wlserver.wlr.seat, surface, nullptr, 0, nullptr);
 	else
 		wlr_seat_keyboard_notify_enter( wlserver.wlr.seat, surface, keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
-
-	wlserver.kb_focus_surface = surface;
 }
 
 void wlserver_key( uint32_t key, bool press, uint32_t time )
@@ -939,12 +847,10 @@ void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x /* = 0 */, int y
 
 void wlserver_mousemotion( int x, int y, uint32_t time )
 {
-	// TODO: Pick the xwayland_server with active focus
-	auto server = steamcompmgr_get_focused_server();
-	if ( server != NULL )
+	if ( g_XWLDpy != NULL )
 	{
-		XTestFakeRelativeMotionEvent( server->get_xdisplay(), x, y, CurrentTime );
-		XFlush( server->get_xdisplay() );
+		XTestFakeRelativeMotionEvent( g_XWLDpy, x, y, CurrentTime );
+		XFlush( g_XWLDpy );
 	}
 }
 
@@ -972,11 +878,9 @@ void wlserver_send_frame_done( struct wlr_surface *surf, const struct timespec *
 	wlr_surface_send_frame_done( surf, when );
 }
 
-gamescope_xwayland_server_t *wlserver_get_xwayland_server( size_t index )
+const char *wlserver_get_nested_display_name( void )
 {
-	if (index >= wlserver.wlr.xwayland_servers.size() )
-		return NULL;
-	return wlserver.wlr.xwayland_servers[index].get();
+	return wlserver.wlr.xwayland_server->display_name;
 }
 
 const char *wlserver_get_wl_display_name( void )
@@ -1018,7 +922,7 @@ void wlserver_surface_init( struct wlserver_surface *surf, long x11_id )
 	wl_list_init( &surf->destroy.link );
 }
 
-void gamescope_xwayland_server_t::set_wl_id( struct wlserver_surface *surf, long id )
+void wlserver_surface_set_wl_id( struct wlserver_surface *surf, long id )
 {
 	if ( surf->wl_id != 0 )
 	{
@@ -1039,31 +943,13 @@ void gamescope_xwayland_server_t::set_wl_id( struct wlserver_surface *surf, long
 	}
 	else
 	{
-		struct wl_resource *resource = wl_client_get_object( xwayland_server->client, id );
+		struct wl_resource *resource = wl_client_get_object( wlserver.wlr.xwayland_server->client, id );
 		if ( resource != nullptr )
 			wlr_surf = wlr_surface_from_resource( resource );
 	}
 
 	if ( wlr_surf != nullptr )
-	{
-		wlr_surf->data = reinterpret_cast<void*>(this);
 		wlserver_surface_set_wlr( surf, wlr_surf );
-	}
-}
-
-bool gamescope_xwayland_server_t::is_xwayland_ready() const
-{
-	return xwayland_ready;
-}
-
-_XDisplay *gamescope_xwayland_server_t::get_xdisplay()
-{
-	return dpy;
-}
-
-const char *gamescope_xwayland_server_t::get_nested_display_name() const
-{
-	return xwayland_server->display_name;
 }
 
 void wlserver_surface_finish( struct wlserver_surface *surf )
@@ -1073,32 +959,8 @@ void wlserver_surface_finish( struct wlserver_surface *surf )
 		wlserver.mouse_focus_surface = nullptr;
 	}
 
-	if ( surf->wlr == wlserver.kb_focus_surface )
-	{
-		wlserver.kb_focus_surface = nullptr;
-	}
-
 	surf->wl_id = 0;
 	surf->wlr = nullptr;
 	wl_list_remove( &surf->pending_link );
 	wl_list_remove( &surf->destroy.link );
-}
-
-void wlserver_set_xwayland_server_mode( size_t idx, int w, int h, int refresh )
-{
-	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server( idx );
-	if ( !server )
-		return;
-	wl_client *client = server->get_client();
-
-	struct wl_resource *resource;
-	wl_resource_for_each( resource, &wlserver.wlr.output->resources )
-	{
-		if ( wl_resource_get_client( resource ) == client )
-		{
-			wl_output_send_mode( resource, WL_OUTPUT_MODE_CURRENT, w, h, refresh * 1000 );
-			wl_output_send_done( resource );
-			wl_log.infof( "Updating mode for xwayland server %zu %dx%d@%d - client %p - resource %p", idx, w, h, refresh, client, resource );
-		}
-	}
 }

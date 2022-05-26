@@ -7,6 +7,8 @@
 extern const char *gamescope_optstring;
 extern const struct option *gamescope_options;
 
+void wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf);
+
 extern std::atomic< bool > g_bRun;
 
 extern int g_nNestedWidth;
@@ -22,27 +24,10 @@ extern bool g_bFullscreen;
 
 extern bool g_bFilterGameWindow;
 
-enum class GamescopeUpscaler : uint32_t
-{
-    BLIT = 0,
-    FSR,
-    NIS
-};
-
-extern GamescopeUpscaler g_upscaler;
-extern int g_upscalerSharpness;
-
 extern bool g_bBorderlessOutputWindow;
 
 extern bool g_bNiceCap;
 extern int g_nOldNice;
 extern int g_nNewNice;
 
-extern bool g_bRt;
-extern int g_nOldPolicy;
-extern struct sched_param g_schedOldParam;
-
-extern int g_nXWaylandCount;
-
-void restore_fd_limit( void );
 bool BIsNested( void );

@@ -20,7 +20,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "modegen.hpp"
+#include "cvt.hpp"
 
 /* top/bottom margin size (% of height) - default: 1.8 */
 #define CVT_MARGIN_PERCENTAGE 1.8
@@ -266,30 +266,4 @@ void generate_cvt_mode(drmModeModeInfo *mode, int hdisplay, int vdisplay,
 	} else {
 		mode->flags |= DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_PVSYNC;
 	}
-}
-
-void generate_fixed_mode(drmModeModeInfo *mode, const drmModeModeInfo *base, int vrefresh, bool use_tuned_clocks)
-{
-	*mode = *base;
-
-	if (!vrefresh)
-		vrefresh = 60;
-
-	if ( use_tuned_clocks )
-	{
-		mode->hdisplay = 800;
-		mode->hsync_start = 840;
-		mode->hsync_end = 844;
-		mode->htotal = 884;
-
-		mode->vdisplay = 1280;
-		mode->vsync_start = 1310;
-		mode->vsync_end = 1314;
-		mode->vtotal = 1322;
-	}
-
-	mode->clock = ( ( mode->htotal * mode->vtotal * vrefresh ) + 999 ) / 1000;
-	mode->vrefresh = (1000 * mode->clock) / (mode->htotal * mode->vtotal);
-
-	snprintf(mode->name, sizeof(mode->name), "%dx%d@%d.00", mode->hdisplay, mode->vdisplay, vrefresh);
 }

@@ -13,7 +13,7 @@
 #include "pipewire.hpp"
 #include "log.hpp"
 
-static LogScope pwr_log("pipewire");
+static LogScope log("pipewire");
 
 static struct pipewire_state pipewire_state = { .stream_node_id = SPA_ID_INVALID };
 static int nudgePipe[2] = { -1, -1 };
@@ -27,63 +27,49 @@ static void destroy_buffer(struct pipewire_buffer *buffer) {
 	assert(!buffer->copying);
 	assert(buffer->buffer == nullptr);
 
-	switch (buffer->type) {
-	case SPA_DATA_MemFd:
-		munmap(buffer->shm.data, buffer->shm.stride * buffer->video_info.size.height);
-		close(buffer->shm.fd);
-		break;
-	case SPA_DATA_DmaBuf:
-		break; // nothing to do
-	default:
-		assert(false); // unreachable
-	}
-
+	munmap(buffer->data, buffer->stride * buffer->video_info.size.height);
+	close(buffer->fd);
 	delete buffer;
 }
 
-static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_builder *builder) {
+static const struct spa_pod *get_format_param(struct spa_pod_builder *builder) {
 	struct spa_rectangle size = SPA_RECTANGLE(g_nOutputWidth, g_nOutputHeight);
 	struct spa_fraction framerate = SPA_FRACTION(0, 1);
-	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
 
-	std::vector<const struct spa_pod *> params;
-
-	struct spa_pod_frame obj_frame, choice_frame;
-	spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
-	spa_pod_builder_add(builder,
-		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
-		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-		SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
-		SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
-		SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerate),
-		0);
-	spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
-	spa_pod_builder_push_choice(builder, &choice_frame, SPA_CHOICE_Enum, 0);
-	spa_pod_builder_long(builder, modifier); // default
-	spa_pod_builder_long(builder, modifier);
-	spa_pod_builder_pop(builder, &choice_frame);
-	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
-
-	params.push_back((const struct spa_pod *) spa_pod_builder_add_object(builder,
+	return (const struct spa_pod *) spa_pod_builder_add_object(builder,
 		SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
 		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
 		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
 		SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
 		SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
-		SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerate)));
-
-	return params;
+		SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerate));
 }
 
 static void request_buffer(struct pipewire_state *state)
 {
 	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(state->stream);
 	if (!pw_buffer) {
-		pwr_log.errorf("warning: out of buffers");
+		log.errorf("warning: out of buffers");
+		state->needs_buffer = true;
 		return;
 	}
 
+	struct spa_buffer *spa_buffer = pw_buffer->buffer;
 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
+
+	struct spa_meta_header *header = (struct spa_meta_header *) spa_buffer_find_meta_data(spa_buffer, SPA_META_Header, sizeof(*header));
+	if (header != nullptr) {
+		header->pts = -1;
+		header->flags = 0;
+		header->seq = state->seq++;
+		header->dts_offset = 0;
+	}
+
+	struct spa_chunk *chunk = spa_buffer->datas[0].chunk;
+	chunk->offset = 0;
+	chunk->size = state->video_info.size.height * state->stride;
+	chunk->stride = state->stride;
+
 	buffer->copying = true;
 
 	// Past this exchange, the PipeWire thread shares the buffer with the
@@ -92,74 +78,26 @@ static void request_buffer(struct pipewire_state *state)
 	assert(old == nullptr);
 }
 
-static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *buffer)
-{
-	std::shared_ptr<CVulkanTexture> &tex = buffer->texture;
-	assert(tex != nullptr);
-	assert(tex->format() == VK_FORMAT_B8G8R8A8_UNORM);
-
-	struct pw_buffer *pw_buffer = buffer->buffer;
-	struct spa_buffer *spa_buffer = pw_buffer->buffer;
-
-	bool needs_reneg = buffer->video_info.size.width != tex->width() || buffer->video_info.size.height != tex->height();
-
-	struct spa_meta_header *header = (struct spa_meta_header *) spa_buffer_find_meta_data(spa_buffer, SPA_META_Header, sizeof(*header));
-	if (header != nullptr) {
-		header->pts = -1;
-		header->flags = needs_reneg ? SPA_META_HEADER_FLAG_CORRUPTED : 0;
-		header->seq = state->seq++;
-		header->dts_offset = 0;
-	}
-
-	struct spa_chunk *chunk = spa_buffer->datas[0].chunk;
-	chunk->flags = needs_reneg ? SPA_CHUNK_FLAG_CORRUPTED : 0;
-
-	struct wlr_dmabuf_attributes dmabuf;
-	switch (buffer->type) {
-	case SPA_DATA_MemFd:
-		chunk->offset = 0;
-		chunk->size = state->video_info.size.height * buffer->shm.stride;
-		chunk->stride = buffer->shm.stride;
-
-		if (!needs_reneg) {
-			int bpp = 4;
-			for (uint32_t i = 0; i < tex->height(); i++) {
-				memcpy(buffer->shm.data + i * buffer->shm.stride, (uint8_t *) tex->mappedData() + i * tex->rowPitch(), bpp * tex->width());
-			}
-		}
-		break;
-	case SPA_DATA_DmaBuf:
-		dmabuf = tex->dmabuf();
-		assert(dmabuf.n_planes == 1);
-		chunk->offset = dmabuf.offset[0];
-		chunk->stride = dmabuf.stride[0];
-		chunk->size = 0; // TODO
-		break;
-	default:
-		assert(false); // unreachable
-	}
-}
-
 static void dispatch_nudge(struct pipewire_state *state, int fd)
 {
 	while (true) {
 		static char buf[1024];
 		if (read(fd, buf, sizeof(buf)) < 0) {
 			if (errno != EAGAIN)
-				pwr_log.errorf_errno("dispatch_nudge: read failed");
+				log.errorf_errno("dispatch_nudge: read failed");
 			break;
 		}
 	}
 
 	if (g_nOutputWidth != state->video_info.size.width || g_nOutputHeight != state->video_info.size.height) {
-		pwr_log.debugf("renegotiating stream params (size: %dx%d)", g_nOutputWidth, g_nOutputHeight);
+		log.debugf("renegociating stream params (size: %dx%d)", g_nOutputWidth, g_nOutputHeight);
 
 		uint8_t buf[1024];
 		struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
-		std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
-		int ret = pw_stream_update_params(state->stream, format_params.data(), format_params.size());
+		const struct spa_pod *format_param = get_format_param(&builder);
+		int ret = pw_stream_update_params(state->stream, &format_param, 1);
 		if (ret < 0) {
-			pwr_log.errorf("pw_stream_update_params failed");
+			log.errorf("pw_stream_update_params failed");
 		}
 	}
 
@@ -171,14 +109,16 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
 		buffer->copying = false;
 
 		if (buffer->buffer != nullptr) {
-			copy_buffer(state, buffer);
-
 			int ret = pw_stream_queue_buffer(state->stream, buffer->buffer);
 			if (ret < 0) {
-				pwr_log.errorf("pw_stream_queue_buffer failed");
+				log.errorf("pw_stream_queue_buffer failed");
 			}
 		} else {
 			destroy_buffer(buffer);
+		}
+
+		if (state->streaming) {
+			request_buffer(state);
 		}
 	}
 }
@@ -187,7 +127,7 @@ static void stream_handle_state_changed(void *data, enum pw_stream_state old_str
 {
 	struct pipewire_state *state = (struct pipewire_state *) data;
 
-	pwr_log.debugf("stream state changed: %s", pw_stream_state_as_string(stream_state));
+	log.debugf("stream state changed: %s", pw_stream_state_as_string(stream_state));
 
 	switch (stream_state) {
 	case PW_STREAM_STATE_PAUSED:
@@ -199,6 +139,7 @@ static void stream_handle_state_changed(void *data, enum pw_stream_state old_str
 		break;
 	case PW_STREAM_STATE_STREAMING:
 		state->streaming = true;
+		request_buffer(state);
 		break;
 	case PW_STREAM_STATE_ERROR:
 	case PW_STREAM_STATE_UNCONNECTED:
@@ -219,30 +160,27 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	int bpp = 4;
 	int ret = spa_format_video_raw_parse(param, &state->video_info);
 	if (ret < 0) {
-		pwr_log.errorf("spa_format_video_raw_parse failed");
+		log.errorf("spa_format_video_raw_parse failed");
 		return;
 	}
-	state->shm_stride = SPA_ROUND_UP_N(state->video_info.size.width * bpp, 4);
+	state->stride = SPA_ROUND_UP_N(state->video_info.size.width * bpp, 4);
 
-	const struct spa_pod_prop *modifier_prop = spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_modifier);
-	state->dmabuf = modifier_prop != nullptr;
-
-	pwr_log.debugf("format changed (size: %dx%d, dmabuf: %d)", state->video_info.size.width, state->video_info.size.height, state->dmabuf);
+	log.debugf("format changed (size: %dx%d)", state->video_info.size.width, state->video_info.size.height);
 
 	uint8_t buf[1024];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 
 	int buffers = 4;
-	int shm_size = state->shm_stride * state->video_info.size.height;
-	int data_type = state->dmabuf ? (1 << SPA_DATA_DmaBuf) : (1 << SPA_DATA_MemFd);
+	int size = state->stride * state->video_info.size.height;
+	int data_type = 1 << SPA_DATA_MemFd;
 
 	const struct spa_pod *buffers_param =
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
 		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
 		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers, 1, 32),
 		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
-		SPA_PARAM_BUFFERS_size, SPA_POD_Int(shm_size),
-		SPA_PARAM_BUFFERS_stride, SPA_POD_Int(state->shm_stride),
+		SPA_PARAM_BUFFERS_size, SPA_POD_Int(size),
+		SPA_PARAM_BUFFERS_stride, SPA_POD_Int(state->stride),
 		SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type));
 	const struct spa_pod *meta_param =
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
@@ -253,7 +191,17 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 
 	ret = pw_stream_update_params(state->stream, params, sizeof(params) / sizeof(params[0]));
 	if (ret != 0) {
-		pwr_log.errorf("pw_stream_update_params failed");
+		log.errorf("pw_stream_update_params failed");
+	}
+}
+
+static void stream_handle_process(void *data)
+{
+	struct pipewire_state *state = (struct pipewire_state *) data;
+
+	if (state->needs_buffer) {
+		state->needs_buffer = false;
+		request_buffer(state);
 	}
 }
 
@@ -295,78 +243,46 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 	struct spa_buffer *spa_buffer = pw_buffer->buffer;
 	struct spa_data *spa_data = &spa_buffer->datas[0];
 
+	if ((spa_data->type & (1 << SPA_DATA_MemFd)) == 0) {
+		log.errorf("unsupported data type");
+		return;
+	}
+
+	int fd = anonymous_shm_open();
+	if (fd < 0) {
+		log.errorf("failed to create shm file");
+		return;
+	}
+
+	off_t size = state->stride * state->video_info.size.height;
+	if (ftruncate(fd, size) != 0) {
+		log.errorf_errno("ftruncate failed");
+		close(fd);
+		return;
+	}
+
+	void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (data == MAP_FAILED) {
+		log.errorf_errno("mmap failed");
+		close(fd);
+		return;
+	}
+
 	struct pipewire_buffer *buffer = new pipewire_buffer();
 	buffer->buffer = pw_buffer;
 	buffer->video_info = state->video_info;
-
-	bool is_dmabuf = (spa_data->type & (1 << SPA_DATA_DmaBuf)) != 0;
-	bool is_memfd = (spa_data->type & (1 << SPA_DATA_MemFd)) != 0;
-
-	buffer->texture = vulkan_acquire_screenshot_texture(is_dmabuf);
-	assert(buffer->texture != nullptr);
-
-	if (is_dmabuf) {
-		const struct wlr_dmabuf_attributes dmabuf = buffer->texture->dmabuf();
-		assert(dmabuf.n_planes == 1);
-
-		off_t size = lseek(dmabuf.fd[0], 0, SEEK_END);
-		if (size < 0) {
-			pwr_log.errorf_errno("lseek failed");
-			goto error;
-		}
-
-		buffer->type = SPA_DATA_DmaBuf;
-
-		spa_data->type = SPA_DATA_DmaBuf;
-		spa_data->flags = SPA_DATA_FLAG_READABLE;
-		spa_data->fd = dmabuf.fd[0];
-		spa_data->mapoffset = dmabuf.offset[0];
-		spa_data->maxsize = size;
-		spa_data->data = nullptr;
-	} else if (is_memfd) {
-		int fd = anonymous_shm_open();
-		if (fd < 0) {
-			pwr_log.errorf("failed to create shm file");
-			goto error;
-		}
-
-		off_t size = state->shm_stride * state->video_info.size.height;
-		if (ftruncate(fd, size) != 0) {
-			pwr_log.errorf_errno("ftruncate failed");
-			close(fd);
-			goto error;
-		}
-
-		void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-		if (data == MAP_FAILED) {
-			pwr_log.errorf_errno("mmap failed");
-			close(fd);
-			goto error;
-		}
-
-		buffer->type = SPA_DATA_MemFd;
-		buffer->shm.stride = state->shm_stride;
-		buffer->shm.data = (uint8_t *) data;
-		buffer->shm.fd = fd;
-
-		spa_data->type = SPA_DATA_MemFd;
-		spa_data->flags = SPA_DATA_FLAG_READABLE;
-		spa_data->fd = fd;
-		spa_data->mapoffset = 0;
-		spa_data->maxsize = size;
-		spa_data->data = data;
-	} else {
-		pwr_log.errorf("unsupported data type");
-		spa_data->type = SPA_DATA_Invalid;
-		goto error;
-	}
+	buffer->stride = state->stride;
+	buffer->data = (uint8_t *) data;
+	buffer->fd = fd;
 
 	pw_buffer->user_data = buffer;
 
-	return;
-
-error:
-	delete buffer;
+	spa_data->type = SPA_DATA_MemFd;
+	spa_data->flags = SPA_DATA_FLAG_READABLE;
+	spa_data->fd = fd;
+	spa_data->mapoffset = 0;
+	spa_data->maxsize = size;
+	spa_data->data = data;
 }
 
 static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
@@ -386,10 +302,10 @@ static const struct pw_stream_events stream_events = {
 	.param_changed = stream_handle_param_changed,
 	.add_buffer = stream_handle_add_buffer,
 	.remove_buffer = stream_handle_remove_buffer,
-	.process = nullptr,
+	.process = stream_handle_process,
 };
 
-enum pipewire_event_type {
+enum event_type {
 	EVENT_PIPEWIRE,
 	EVENT_NUDGE,
 	EVENT_COUNT // keep last
@@ -397,8 +313,6 @@ enum pipewire_event_type {
 
 static void run_pipewire(struct pipewire_state *state)
 {
-	pthread_setname_np( pthread_self(), "gamescope-pw" );
-
 	struct pollfd pollfds[] = {
 		[EVENT_PIPEWIRE] = {
 			.fd = pw_loop_get_fd(state->loop),
@@ -414,12 +328,12 @@ static void run_pipewire(struct pipewire_state *state)
 	while (state->running) {
 		int ret = poll(pollfds, EVENT_COUNT, -1);
 		if (ret < 0) {
-			pwr_log.errorf_errno("poll failed");
+			log.errorf_errno("poll failed");
 			break;
 		}
 
 		if (pollfds[EVENT_PIPEWIRE].revents & POLLHUP) {
-			pwr_log.errorf("lost connection to server");
+			log.errorf("lost connection to server");
 			break;
 		}
 
@@ -428,7 +342,7 @@ static void run_pipewire(struct pipewire_state *state)
 		if (pollfds[EVENT_PIPEWIRE].revents & POLLIN) {
 			ret = pw_loop_iterate(state->loop, -1);
 			if (ret < 0) {
-				pwr_log.errorf("pw_loop_iterate failed");
+				log.errorf("pw_loop_iterate failed");
 				break;
 			}
 		}
@@ -438,7 +352,7 @@ static void run_pipewire(struct pipewire_state *state)
 		}
 	}
 
-	pwr_log.infof("exiting");
+	log.infof("exiting");
 	pw_stream_destroy(state->stream);
 	pw_core_disconnect(state->core);
 	pw_context_destroy(state->context);
@@ -452,25 +366,25 @@ bool init_pipewire(void)
 	pw_init(nullptr, nullptr);
 
 	if (pipe2(nudgePipe, O_CLOEXEC | O_NONBLOCK) != 0) {
-		pwr_log.errorf_errno("pipe2 failed");
+		log.errorf_errno("pipe2 failed");
 		return false;
 	}
 
 	state->loop = pw_loop_new(nullptr);
 	if (!state->loop) {
-		pwr_log.errorf("pw_loop_new failed");
+		log.errorf("pw_loop_new failed");
 		return false;
 	}
 
 	state->context = pw_context_new(state->loop, nullptr, 0);
 	if (!state->context) {
-		pwr_log.errorf("pw_context_new failed");
+		log.errorf("pw_context_new failed");
 		return false;
 	}
 
 	state->core = pw_context_connect(state->context, nullptr, 0);
 	if (!state->core) {
-		pwr_log.errorf("pw_context_connect failed");
+		log.errorf("pw_context_connect failed");
 		return false;
 	}
 
@@ -479,7 +393,7 @@ bool init_pipewire(void)
 			PW_KEY_MEDIA_CLASS, "Video/Source",
 			nullptr));
 	if (!state->stream) {
-		pwr_log.errorf("pw_stream_new failed");
+		log.errorf("pw_stream_new failed");
 		return false;
 	}
 
@@ -488,24 +402,24 @@ bool init_pipewire(void)
 
 	uint8_t buf[1024];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
-	std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
+	const struct spa_pod *format_param = get_format_param(&builder);
 
 	enum pw_stream_flags flags = (enum pw_stream_flags)(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS);
-	int ret = pw_stream_connect(state->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, format_params.data(), format_params.size());
+	int ret = pw_stream_connect(state->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, &format_param, 1);
 	if (ret != 0) {
-		pwr_log.errorf("pw_stream_connect failed");
+		log.errorf("pw_stream_connect failed");
 		return false;
 	}
 
 	while (state->stream_node_id == SPA_ID_INVALID) {
 		int ret = pw_loop_iterate(state->loop, -1);
 		if (ret < 0) {
-			pwr_log.errorf("pw_loop_iterate failed");
+			log.errorf("pw_loop_iterate failed");
 			return false;
 		}
 	}
 
-	pwr_log.infof("stream available on node ID: %u", state->stream_node_id);
+	log.infof("stream available on node ID: %u", state->stream_node_id);
 
 	std::thread thread(run_pipewire, state);
 	thread.detach();
@@ -520,10 +434,6 @@ uint32_t get_pipewire_stream_node_id(void)
 
 struct pipewire_buffer *dequeue_pipewire_buffer(void)
 {
-	struct pipewire_state *state = &pipewire_state;
-	if (state->streaming) {
-		request_buffer(state);
-	}
 	return out_buffer.exchange(nullptr);
 }
 
@@ -537,5 +447,5 @@ void push_pipewire_buffer(struct pipewire_buffer *buffer)
 void nudge_pipewire(void)
 {
 	if (write(nudgePipe[1], "\n", 1) < 0)
-		pwr_log.errorf_errno("nudge_pipewire: write failed");
+		log.errorf_errno("nudge_pipewire: write failed");
 }
