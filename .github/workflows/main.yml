@@ -34,4 +34,4 @@ jobs:
         with:
           name: gamescope-${{ env.GIT_SHA }}
           path: |
-            gamescope
+            ./build-gcc/gamescope
