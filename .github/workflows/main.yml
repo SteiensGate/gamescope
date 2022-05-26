@@ -31,3 +31,9 @@ jobs:
           export CC=clang CXX=clang++
           meson build-clang/ --werror --auto-features=enabled
           ninja -C build-clang/
+      - name: Upload to Artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: gamescope-${{ env.GIT_SHA }}
+          path: |
+            gamescope
